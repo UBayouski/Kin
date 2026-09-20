@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kin"
+version = "0.1.0"
+description = "Companion brain for a Vector robot, powered by Nemotron on Nebius Token Factory"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40",
+    "python-dotenv>=1.0",
+    "pillow>=10.0",
+    "numpy>=1.26",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# Installed separately so the LLM side works without the robot SDK.
+robot = ["wirepod_vector_sdk"]
+# Hub audio: natural voice (Piper) and speech recognition (Whisper) on the hub's speaker and microphone.
+voice = ["sounddevice", "faster-whisper", "piper-tts"]
+# Only for scripts/escapepod_mdns.py (Windows mDNS workaround).
+mdns = ["zeroconf"]
+
+[tool.setuptools]
+packages = ["kin"]
