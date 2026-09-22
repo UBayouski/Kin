@@ -33,6 +33,23 @@ CREATE TABLE IF NOT EXISTS events (
     kind TEXT NOT NULL,     -- e.g. 'task', 'presence', 'alert', 'consolidation'
     detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS inbox (
+    update_id INTEGER PRIMARY KEY,  -- Telegram's id; makes re-delivery harmless
+    ts TEXT NOT NULL,
+    chat_id INTEGER NOT NULL,
+    sender TEXT NOT NULL,
+    text TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    handled INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS heard (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    text TEXT NOT NULL,             -- what Vector's own microphone heard, as transcribed by wire-pod
+    ack TEXT NOT NULL DEFAULT '',   -- what Vector said back in his own voice ("On it!")
+    attempts INTEGER NOT NULL DEFAULT 0,
+    handled INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -103,7 +120,7 @@ class Memory:
         self.path = Path(path or config.db_path())
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # The agent calls the planner from a worker thread, but only ever touches memory from one at a time.
-        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self.db = sqlite3.connect(self.path, check_same_thread=False, timeout=15)
         self.db.executescript(SCHEMA)
         self._embed = embed or _default_embedder()
 
@@ -222,6 +239,20 @@ class Memory:
             "SELECT ts, kind, detail FROM events WHERE ts LIKE ? ORDER BY id", (day.isoformat() + "%",)
         ).fetchall()
 
+    def last_sign_of_person(self, day: date) -> str | None:
+        """Timestamp of the latest evidence that the person was around on that day: something they said,
+        a face seen, a pet, or a reminder they confirmed or declined."""
+        prefix = day.isoformat() + "%"
+        rows = [
+            self.db.execute("SELECT max(ts) FROM conversation WHERE speaker = 'person' AND ts LIKE ?", (prefix,)),
+            self.db.execute("SELECT max(ts) FROM events WHERE kind = 'presence' AND ts LIKE ?", (prefix,)),
+            self.db.execute(
+                "SELECT max(ts) FROM reminder_log WHERE outcome IN ('confirmed', 'declined') AND ts LIKE ?", (prefix,)
+            ),
+        ]
+        stamps = [row.fetchone()[0] for row in rows]
+        return max((s for s in stamps if s), default=None)
+
     def log_event(self, kind: str, detail: str) -> None:
         self.db.execute("INSERT INTO events (ts, kind, detail) VALUES (?, ?, ?)", (_now(), kind, detail))
         self.db.commit()
@@ -229,6 +260,59 @@ class Memory:
     def last_event_time(self, kind: str) -> str | None:
         row = self.db.execute("SELECT ts FROM events WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind,)).fetchone()
         return row[0] if row else None
+
+    # --- family inbox ------------------------------------------------------------------------------------------------
+    # Family messages are written here the moment they arrive and marked handled only once dealt with,
+    # so a restart or crash cannot lose one.
+
+    def inbox_add(self, update_id: int, chat_id: int, sender: str, text: str) -> None:
+        self.db.execute(
+            "INSERT OR IGNORE INTO inbox (update_id, ts, chat_id, sender, text) VALUES (?, ?, ?, ?, ?)",
+            (update_id, _now(), chat_id, sender, text),
+        )
+        self.db.commit()
+
+    def inbox_next(self, max_attempts: int = 3) -> tuple[int, int, str, str, str] | None:
+        """The oldest unhandled message as (update_id, chat_id, sender, text, received_at), counting this as a try.
+
+        A message that keeps failing is given up on after `max_attempts`, so it cannot wedge the service.
+        """
+        row = self.db.execute(
+            "SELECT update_id, chat_id, sender, text, ts FROM inbox WHERE handled = 0 AND attempts < ? "
+            "ORDER BY update_id LIMIT 1", (max_attempts,),
+        ).fetchone()
+        if row:
+            self.db.execute("UPDATE inbox SET attempts = attempts + 1 WHERE update_id = ?", (row[0],))
+            self.db.commit()
+        return row
+
+    def inbox_done(self, update_id: int) -> None:
+        self.db.execute("UPDATE inbox SET handled = 1 WHERE update_id = ?", (update_id,))
+        self.db.commit()
+
+    # --- heard through Vector ----------------------------------------------------------------------------------------
+    # Requests that came in through Vector's own microphone (wake word or back button) and that wire-pod did
+    # not recognise as one of his built-in commands. Durable for the same reason as the family inbox.
+
+    def heard_add(self, text: str, ack: str = "") -> int:
+        cursor = self.db.execute("INSERT INTO heard (ts, text, ack) VALUES (?, ?, ?)", (_now(), text.strip(), ack))
+        self.db.commit()
+        return cursor.lastrowid
+
+    def heard_next(self, max_attempts: int = 2) -> tuple[int, str, str, str] | None:
+        """The oldest unhandled request as (id, text, ack, received_at). Does not count as a try; see heard_try."""
+        return self.db.execute(
+            "SELECT id, text, ack, ts FROM heard WHERE handled = 0 AND attempts < ? ORDER BY id LIMIT 1",
+            (max_attempts,),
+        ).fetchone()
+
+    def heard_try(self, heard_id: int) -> None:
+        self.db.execute("UPDATE heard SET attempts = attempts + 1 WHERE id = ?", (heard_id,))
+        self.db.commit()
+
+    def heard_done(self, heard_id: int) -> None:
+        self.db.execute("UPDATE heard SET handled = 1 WHERE id = ?", (heard_id,))
+        self.db.commit()
 
     # --- reminders -------------------------------------------------------------------------------------------------
 

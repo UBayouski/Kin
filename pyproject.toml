@@ -21,8 +21,12 @@ dependencies = [
 robot = ["wirepod_vector_sdk"]
 # Hub audio: natural voice (Piper) and speech recognition (Whisper) on the hub's speaker and microphone.
 voice = ["sounddevice", "faster-whisper", "piper-tts"]
+dev = ["pytest>=8"]
 # Only for scripts/escapepod_mdns.py (Windows mDNS workaround).
 mdns = ["zeroconf"]
 
 [tool.setuptools]
 packages = ["kin"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

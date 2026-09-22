@@ -10,7 +10,7 @@ from kin import config, llm
 from kin.memory import Memory
 
 PROMPT = """\
-You write a short daily note to the family of an older adult who lives alone with Kin, a companion robot.
+You write a short daily note to the family of {person}, an older adult who lives alone with Kin, a companion robot.
 The note is about {day}. Write it from the log below and nothing else.
 
 Conversation (speaker: text):
@@ -63,6 +63,7 @@ def build(memory: Memory, day: date | None = None) -> str:
         return f"Kin's note for {day:%A %d %B}: a quiet day. No conversations or reminders were recorded."
 
     prompt = PROMPT.format(
+        person=config.person_name() or "a person",
         day=f"{day:%A %d %B %Y}",
         conversation="\n".join(f"[{ts[11:16]}] {who}: {text}" for ts, who, text in turns) or "(none)",
         reminders="\n".join(f"[{ts[11:16]}] {text}: {outcome}" for ts, text, outcome in reminders

@@ -12,7 +12,10 @@ from kin import config
 
 @lru_cache(maxsize=1)
 def client() -> OpenAI:
-    return OpenAI(api_key=config.nebius_api_key(), base_url=config.nebius_base_url())
+    # The library's defaults are a 10-minute timeout and two retries: a request that stalls could hold a
+    # conversation for half an hour (one did, for minutes, mid check-in on Sep 22). Planner calls set a
+    # tighter limit of their own; this one bounds the nightly, whose long answers take a minute or two.
+    return OpenAI(api_key=config.nebius_api_key(), base_url=config.nebius_base_url(), timeout=180, max_retries=1)
 
 
 def list_models() -> list[str]:

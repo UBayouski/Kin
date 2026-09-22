@@ -71,26 +71,40 @@ def _date(value) -> str | None:
     return value if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) else None
 
 
-def consolidate(memory: Memory, dry_run: bool = False) -> Report:
-    facts = memory.active_facts(limit=200)
-    turns = memory.turns_since(memory.last_event_time("consolidation"))
-    report = Report()
-    if not facts and not turns:
-        return report
+def render_turns(turns) -> str:
+    return "\n".join(f"[{ts[:16].replace('T', ' ')}] {who}: {text}" for ts, who, text in turns)
 
-    prompt = PROMPT.format(
-        today=f"{datetime.now():%A, %Y-%m-%d}",
-        facts="\n".join(f.render() for f in facts) or "(none)",
-        conversation="\n".join(f"[{ts[:16].replace('T', ' ')}] {who}: {text}" for ts, who, text in turns) or "(none)",
-    )
+
+def propose(today: str, facts_text: str, conversation_text: str) -> list[dict]:
+    """The thinking half: needs only text and Nebius credentials, so it can run anywhere (the nightly job)."""
+    prompt = PROMPT.format(today=today, facts=facts_text or "(none)", conversation=conversation_text or "(none)")
     response = llm.client().chat.completions.create(
         model=config.nightly_model(),
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=4000,
+        max_tokens=8000,  # a reasoning model thinks first; at 4000 it ran out before the JSON two nights running
         temperature=0.2,
     )
-    report.operations = _parse(response.choices[0].message.content or "")
-    known_ids = {f.id for f in facts}
+    choice = response.choices[0]
+    if choice.finish_reason == "length":
+        raise ValueError("model ran out of tokens before finishing its answer")
+    return _parse(choice.message.content or "")
+
+
+def consolidate(memory: Memory, dry_run: bool = False) -> Report:
+    facts = memory.active_facts(limit=200)
+    turns = memory.turns_since(memory.last_event_time("consolidation"))
+    if not facts and not turns:
+        return Report()
+    operations = propose(
+        f"{datetime.now():%A, %Y-%m-%d}", "\n".join(f.render() for f in facts), render_turns(turns)
+    )
+    return apply(memory, operations, dry_run)
+
+
+def apply(memory: Memory, operations: list[dict], dry_run: bool = False) -> Report:
+    """The doing half, on the hub: validate each proposed operation against memory, then apply it."""
+    report = Report(operations=operations)
+    known_ids = {f.id for f in memory.active_facts(limit=500)}
 
     for op in report.operations:
         kind, fact_id = op.get("op"), op.get("id")

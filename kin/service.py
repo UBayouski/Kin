@@ -3,44 +3,83 @@
     python -m kin.service                 run all day
     python -m kin.service --checkin-now   run the morning check-in immediately, then carry on
     python -m kin.service --once          exit after the first task (testing, demos)
+    python -m kin.service --presence-now  act as if the person has not been seen by the deadline
 
 Triggers, checked about once a second:
   - the daily check-in time (KIN_CHECKIN_TIME)
   - reminders that are due, with gentle re-nudges
-  - the person petting Vector's back, to start a conversation
-  - a nightly memory tidy-up
+  - the person speaking to Vector ("Hey Vector" or his back button; a pet too with KIN_PET_TO_TALK=on)
+  - presence: quiet looks through the morning; if there is no sign of the person by a deadline he calls
+    out once, then the family is told (and told again when the person turns up)
+  - a nightly reflection: memory tidy-up, weekly trends for the family, and an audit of his own behaviour
   - messages from the family (Telegram), delivered in person; a daily note and alerts go back to them
 
 Between tasks Vector is left to his own personality; control is borrowed per task.
 """
 
-import queue
 import sys
 import time
+import traceback
 from datetime import datetime
 
 from kin import robot as kin_robot
-from kin import config, digest, family, voice
+from kin import alerts, config, digest, family, gateway, nightly, voice, wirepod
 from kin.agent import Agent
-from kin.consolidate import consolidate
 from kin.memory import Memory, Reminder
 
-CONSOLIDATE_AT = "03:00"
-TOUCH_HOLD_SECONDS = 0.6   # a deliberate pet, not a brush
-TOUCH_COOLDOWN_SECONDS = 20
-RECONNECT_SECONDS = 30
+NIGHTLY_AT = "03:00"
+
+RECONNECT_SECONDS = 15
+ROBOT_DOWN_MINUTES = 10  # unreachable this long, and the family is told
+HEARTBEAT_SECONDS = 30
 
 CHECKIN = (
     "[Daily check-in. Find the person and greet them warmly, by name if you know it, in a way that fits "
     "the time of day. Ask how they are, and in the morning how they slept. Follow up on one thing from "
     "your facts: a recent event, a worry, a visitor. If an answer is vague, ask one gentle follow-up. "
-    "Save anything new worth keeping. If web search is available, tell them the weather in one sentence. "
-    "Keep it to a few exchanges, wish them a good day, then go home.]"
+    "Always respond to what they just told you before moving on: a reply that ignores their words sounds "
+    "like you were not listening. Ask what they have planned today; when they tell you, say something "
+    "about it and work today's weather into that (`weather` tool, one sentence: going out means what to "
+    "wear; staying in, just what it is like outside). Save plans and anything else worth keeping. "
+    "Keep it to a few exchanges. To close, `ask` once whether there is anything you can do for them; help "
+    "if there is. If they say no, finish, and make your closing text a warm wish for the day in a few "
+    "words; it is spoken. If no reply is heard, just finish."
 )
+PRESENCE_CHECK = (
+    "[You have not seen or heard the person yet today and it is getting late in the morning. Look for them, "
+    "then call out once with `ask`, warmly, to check they are there. If they answer, have a short friendly "
+    "exchange. If there is no answer, do not keep calling. Do not go home and do not message the family "
+    "yourself: both are handled for you as soon as you finish.]"
+)
+LOW_BATTERY = (
+    "[Your battery is low and you are off your charger. Try `go_home` once. If you cannot get there, tell "
+    "the person your battery is low and ask them, once and politely, to put you on your charger. You cannot "
+    "tell from their words whether they have done it: thank them and finish, and never say you are charging.]"
+)
+STRANDED_MINUTES = 10  # low and off the charger this long, and the family is told
+BODY_LOST_MINUTES = 5  # his body board silent this long, and the family is told
+ACK_SECONDS = 3.5      # how long Vector needs to say "On it!" himself before Kin takes over
+HEARD_STALE_MINUTES = 3
 TOUCHED = (
-    "[The person petted your back to get your attention. Say a short friendly hello and ask what you can "
-    "do for them, then help with whatever they say. When they are done, go home.]"
+    "[The person petted your back to get your attention. Greet them and ask what they need in ONE `ask` "
+    "call, for example 'Hello Jennie, what can I do for you?'. Do not `say` a greeting first: that makes "
+    "two questions in a row. Then help with whatever they say. "
 )
+# How a conversation the person started carries on: one open door after each answer, and silence closes it.
+ANYTHING_ELSE = (
+    "When you have answered or done what they asked, `ask` once, briefly, whether there is anything else "
+    "(\"Anything else?\"). If they want something more, help and ask again. If they say no, the conversation "
+    "is over: finish, and make your closing text a sign-off of a few words (\"Okay, I'm here if you need "
+    "me.\"); it is spoken. If no reply is heard, they have walked away: do not ask a second time, do not "
+    "`say` anything more, just finish."
+)
+
+
+def going_home() -> str:
+    """Added to a task's instructions only when Kin may have driven Vector off his charger. While he stays
+    on it there is nowhere to go back to; and if he is off it because he wandered or was lifted, docking
+    mostly fails and ends in a request to be carried. A low battery off the charger is handled on its own."""
+    return "" if config.stay_on_charger() else " When you are finished, go home with `go_home`."
 
 
 def reminder_prompt(reminder: Reminder, attempt: int) -> str:
@@ -48,8 +87,8 @@ def reminder_prompt(reminder: Reminder, attempt: int) -> str:
     return (
         f"[Reminder #{reminder.id} is due: '{reminder.text}' (set for {reminder.time_of_day}).{again} "
         "Find the person, then `ask` them about it in a warm, natural way. Record the result with "
-        "`reminder_outcome`: confirmed, declined, or no_response if you cannot find them or get no answer. "
-        "Then go home.]"
+        "`reminder_outcome`: confirmed, declined, or no_response if you cannot find them or get no answer."
+        + going_home() + "]"
     )
 
 
@@ -58,15 +97,25 @@ def log(text: str) -> None:
 
 
 class Service:
-    def __init__(self, memory: Memory, checkin_now: bool = False, once: bool = False):
+    def __init__(self, memory: Memory, checkin_now: bool = False, once: bool = False, presence_now: bool = False):
         self.memory = memory
         self.checkin_now = checkin_now
         self.once = once
+        self.presence_now = presence_now  # testing: act as if the deadline has passed with no sign of the person
+        self._faces: kin_robot.FaceWatcher | None = None
+        self._next_quiet_look = 0.0
+        self._last_presence_logged = 0.0
         self.ears = voice.make_ears()
         self.family = family.Family() if family.available() else None
-        self._touch_since: float | None = None
-        self._touch_ready_at = 0.0
-        self._reported_missed: set[tuple[str, int]] = set()
+        self._touch: kin_robot.TouchWatcher | None = None
+        self._running_flat = False
+        self._low_readings = 0
+        self._flat_since: float | None = None
+        self._next_heartbeat = 0.0
+        self._battery: tuple[str, bool] | None = None
+        self._volts = 0.0
+        self._warmed_for: int | None = None  # the heard request the planner was last warmed up for
+        self._body_lost_since: float | None = None
 
     # --- what is due ----------------------------------------------------------------------------------------------
 
@@ -79,63 +128,246 @@ class Service:
             return True
         return datetime.now().strftime("%H:%M") >= config.checkin_time() and not self._done_today("checkin")
 
-    def _petted(self, robot) -> bool:
-        now = time.monotonic()
-        if not kin_robot.is_touched(robot) or now < self._touch_ready_at:
-            self._touch_since = None
-            return False
-        self._touch_since = self._touch_since or now
-        if now - self._touch_since < TOUCH_HOLD_SECONDS:
-            return False
-        self._touch_since, self._touch_ready_at = None, now + TOUCH_COOLDOWN_SECONDS
-        return True
 
     # --- one pass -------------------------------------------------------------------------------------------------
 
     def _handle_family(self, agent: Agent) -> bool:
         """Deal with one waiting family message. Returns whether the robot was used."""
-        try:
-            message = self.family.incoming.get_nowait()
-        except queue.Empty:
+        row = self.memory.inbox_next()
+        if row is None:
             return False
-        command = message.text.split()[0].lower()
+        update_id, chat_id, sender, text, received_at = row
+        # If this raises (say the robot link drops mid-delivery) the message stays unhandled and is tried
+        # again after the reconnect, up to three times.
+        used_robot = self._handle_family_message(agent, chat_id, sender, text, received_at)
+        self.memory.inbox_done(update_id)
+        return used_robot
+
+    def _handle_family_message(self, agent: Agent, chat_id: int, sender: str, text: str, received_at: str) -> bool:
+        command = text.split()[0].lower()
         if command in ("/start", "/help"):
             self.family.send(
                 "I'm Kin. Send me any message and I will deliver it in person and tell you the reply.\n"
-                "/status - how today is going\n/digest - today's note now",
-                chat_id=message.chat_id,
+                "/status - how today is going\n/digest - today's note now\n/week - patterns over the last week",
+                chat_id=chat_id,
             )
         elif command == "/status":
-            self.family.send(digest.status(self.memory), chat_id=message.chat_id)
+            self.family.send(digest.status(self.memory), chat_id=chat_id)
         elif command == "/digest":
-            self.family.send(digest.build(self.memory), chat_id=message.chat_id)
+            self.family.send(digest.build(self.memory), chat_id=chat_id)
+        elif command == "/week":
+            self.family.send("Kin's weekly note\n\n" + nightly.latest_trends(self.memory), chat_id=chat_id)
         else:
-            log(f"family message from {message.sender}")
-            self.memory.log_event("family_in", f"{message.sender}: {message.text}")
-            prompt = f"[Message from family member {message.sender}, to deliver in person: \"{message.text}\"]"
+            log(f"family message from {sender}")
+            self.memory.log_event("family_in", f"{sender}: {text}")
+            waited = (datetime.now() - datetime.fromisoformat(received_at)).total_seconds() / 60
+            late = f" It arrived {waited:.0f} minutes ago; mention that it is from earlier." if waited > 10 else ""
+            prompt = f"[Message from family member {sender}, to deliver in person: \"{text}\".{late}]"
             log("done: " + agent.run(prompt, speaker="system"))
             return True
         return False
 
-    def tick(self, robot, agent: Agent) -> bool:
-        """Run at most one task. Returns whether one ran."""
-        if self.family and self._handle_family(agent):
+    def _presence(self, robot, agent: Agent) -> bool:
+        """Keep track of whether the person has been around today. Returns whether the robot ran a task."""
+        now, clock, today = time.monotonic(), datetime.now().strftime("%H:%M"), datetime.now().date()
+
+        if self._faces.seen() and now - self._last_presence_logged > 15 * 60:
+            self._last_presence_logged = now
+            self.memory.log_event("presence", "face seen")
+
+        if note := alerts.report_all_clear(self.memory, self.family):
+            log(note)
+
+        deadline = config.presence_deadline()
+        if deadline.lower() == "off":
+            return False
+        seen = self.memory.last_sign_of_person(today) is not None and not self.presence_now
+        if seen:
+            return False
+
+        if clock >= deadline or self.presence_now:
+            if self._done_today("presence_check") and not self.presence_now:
+                return False
+            self.presence_now = False
+            log("presence check: no sign of the person today; looking and calling out")
+            self._faces.seen()  # discard anything seen before the check; only what happens from now counts
+            started = datetime.now().isoformat(timespec="seconds")
+            summary = agent.run(PRESENCE_CHECK, speaker="system")
+            self.memory.log_event("presence_check", summary)
+            log("done: " + summary)
+            if self._faces.seen():  # the watcher keeps looking during the task; a glimpse while turning counts
+                self.memory.log_event("presence", "face seen during the presence check")
+            last = self.memory.last_sign_of_person(today)
+            if last and last >= started:
+                log("presence check: the person is here")
+            elif alert := alerts.report_absence(self.memory, self.family):
+                log(f"alert: {alert}")
+            # Only now the slow part. The family should not wait on a docking manoeuvre.
+            if not config.stay_on_charger():  # otherwise he looked and called from his charger and never left it
+                with kin_robot.control(robot):
+                    log("going home: " + agent.tools.dispatch("go_home", "{}"))
             return True
 
-        if self._petted(robot):
-            log("petted -> conversation")
-            log("done: " + agent.run(TOUCHED, speaker="system"))
+        if clock >= config.presence_start() and now >= self._next_quiet_look:
+            self._next_quiet_look = now + config.presence_look_minutes() * 60
+            if robot.status.is_on_charger:
+                found = kin_robot.quiet_look(robot)
+                log("quiet look: " + ("saw someone" if found else "no one in view"))
+                if found:
+                    self.memory.log_event("presence", "face seen on a quiet look")
+        return False
+
+
+    @staticmethod
+    def _acknowledge_touch(robot) -> None:
+        """React the instant a pet registers. The planner takes a couple of seconds to think, and with no
+        reaction in that gap people assume the pet failed and try again."""
+        try:
+            with kin_robot.control(robot):
+                kin_robot.call(robot.anim.play_animation_trigger, "ReactToTouchInitial", timeout=8)
+        except Exception:
+            pass  # a courtesy; never let it block the conversation
+
+    def _heartbeat(self, robot) -> None:
+        """Check the link every so often. A dead link raises, and the run loop reconnects.
+
+        Without this a dropped connection (Vector rebooting, Wi-Fi loss) goes unnoticed until the next task.
+        """
+        now = time.monotonic()
+        if now < self._next_heartbeat:
+            return
+        self._next_heartbeat = now + HEARTBEAT_SECONDS
+        battery = kin_robot.call(robot.get_battery_state, timeout=10)
+        level = {1: "low", 2: "ok", 3: "full"}.get(battery.battery_level, "?")
+        state = (level, battery.is_on_charger_platform)
+        # On Sep 20 he ran flat and went dark four minutes after the firmware's own "low" flag, so the
+        # voltage is watched as well.
+        # Two readings in a row, because one can lie: right after a boot he reported "full" at 3.61 V.
+        body_lost = self._watch_body(
+            battery.battery_level == 3 and battery.battery_volts < 3.7  # worth a second of touch samples?
+            and kin_robot.body_silent(battery.battery_level, battery.battery_volts, kin_robot.touch_samples(robot)))
+        # With his body silent the battery figures are stale, so they say nothing about running flat.
+        low_now = ((level == "low" or battery.battery_volts < 3.65) and not battery.is_on_charger_platform
+                   and not body_lost)
+        self._low_readings = self._low_readings + 1 if low_now else 0
+        self._running_flat = self._low_readings >= 2
+        # Log on any change of level or charger state, and on each 0.05 V step, so the run-up to a reboot is visible.
+        if state != self._battery or abs(battery.battery_volts - self._volts) >= 0.05:
+            self._battery, self._volts = state, battery.battery_volts
+            log(f"battery {level} ({battery.battery_volts:.2f} V), on charger: {battery.is_on_charger_platform}")
+
+    def _watch_body(self, silent: bool) -> bool:
+        """Follow whether Vector's body board is answering, and tell the family when it has not for a while.
+
+        Brief losses recover by themselves (two of a few minutes each came before the one that stuck), and
+        he reads the same way for a moment after a boot, so only a lasting one is reported."""
+        now = time.monotonic()
+        if not silent:
+            if self._body_lost_since is not None:
+                log("his body is answering again")
+                if note := alerts.report_body_back(self.memory, self.family):
+                    log(note)
+            self._body_lost_since = None
+            return False
+        if self._body_lost_since is None:
+            self._body_lost_since = now
+            log("his body is not answering (battery 'full' at an impossible voltage, touch sensor frozen); watching")
+        minutes = (now - self._body_lost_since) / 60
+        if minutes >= BODY_LOST_MINUTES:
+            if alert := alerts.report_body_down(self.memory, self.family, minutes):
+                log(f"alert: {alert}")
+        return True
+
+    def _handle_heard(self, agent: Agent) -> bool:
+        """A request that came through Vector's own microphone (wake word or back button)."""
+        row = self.memory.heard_next()
+        if row is None:
+            return False
+        heard_id, text, ack, received_at = row
+        age = (datetime.now() - datetime.fromisoformat(received_at)).total_seconds()
+        if age < ACK_SECONDS:
+            if self._warmed_for != heard_id:  # use the wait: the first planner call of a task is the slow one
+                self._warmed_for = heard_id
+                agent.warm_up()
+            self._forget_touch()  # his back button is beside the touch sensor: pressing it is not a pet
+            return False  # Vector is still saying his acknowledgement; wire-pod holds him until he has
+        if age > HEARD_STALE_MINUTES * 60:
+            log(f"heard earlier, too old to act on now: {text!r}")
+            self.memory.heard_done(heard_id)
+            return False
+        log(f"heard through Vector: {text!r} (he said {ack!r})")
+        self.memory.log_event("presence", "spoke to Vector")
+        self.memory.heard_try(heard_id)  # counted before running, so a request that crashes Kin is not retried forever
+        note = (f"This request was heard through Vector's own microphone after the wake word or his back button, "
+                f"and he has already answered \"{ack}\" in his own voice. Do not greet or acknowledge again; go "
+                "straight to helping. His microphone is weak, so the words may be garbled: if they make no sense, "
+                "ask the person to say it again. From here on you hear them through a better microphone. "
+                + ANYTHING_ELSE + going_home())
+        log("done: " + agent.run(text, speaker="person", note=note))
+        self.memory.heard_done(heard_id)
+        self._forget_touch()  # a hand on his back during the request is not a new request
+        return True
+
+    def _forget_touch(self) -> None:
+        if self._touch is not None:
+            self._touch.discard()
+
+    def _rescue_battery(self, agent: Agent) -> bool:
+        """Off the charger with a low battery: get home or get help, before he runs flat."""
+        if not self._running_flat:
+            self._flat_since = None
+            return False
+        now = time.monotonic()
+        if self._flat_since is None:
+            self._flat_since = now
+            log("battery low and off the charger: going home or asking for help")
+            log("done: " + agent.run(LOW_BATTERY, speaker="system"))
+            return True
+        minutes = (now - self._flat_since) / 60
+        if minutes >= STRANDED_MINUTES:
+            if alert := alerts.report_stranded(self.memory, self.family, minutes):
+                log(f"alert: {alert}")
+        return False
+
+    def tick(self, robot, agent: Agent) -> bool:
+        """Run at most one task. Returns whether one ran."""
+        self._heartbeat(robot)
+        if self._rescue_battery(agent):
+            return True
+        if self.family and self._handle_family(agent):
+            return True
+        if self._handle_heard(agent):
+            return True
+
+        if self._touch.petted():
+            talk = config.pet_to_talk()
+            log("petted -> conversation" if talk else "petted")
+            # A pet is proof the person is here; say so at once rather than after the conversation.
+            self.memory.log_event("presence", "petted")
+            if note := alerts.report_all_clear(self.memory, self.family):
+                log(note)
+            if not talk:
+                return False  # a pet is just a pet: he purrs by himself. Talking starts with "Hey Vector" or his button
+            agent.warm_up()
+            self._acknowledge_touch(robot)
+            log("done: " + agent.run(TOUCHED + ANYTHING_ELSE + going_home() + "]", speaker="system"))
+            self._touch.discard()
+            return True
+
+        if self._presence(robot, agent):
             return True
 
         if self._checkin_due():
             self.checkin_now = False
             log("check-in")
-            summary = agent.run(CHECKIN, speaker="system")
+            summary = agent.run(CHECKIN + going_home() + "]", speaker="system")
             self.memory.log_event("checkin", summary)
             log("done: " + summary)
             return True
 
-        for reminder in self.memory.reminders_due():
+        for reminder in self.memory.reminders_due(
+            renudge_minutes=config.renudge_minutes(), max_attempts=config.reminder_attempts()
+        ):
             attempt = 1 + sum(
                 1 for ts, text, outcome in self.memory.reminder_history(datetime.now().date())
                 if text == reminder.text and outcome == "no_response"
@@ -145,48 +377,84 @@ class Service:
             log("done: " + agent.run(reminder_prompt(reminder, attempt), speaker="system"))
             return True  # one task per tick; the next is picked up on the following pass
 
-        today = datetime.now().date().isoformat()
-        for reminder in self.memory.reminders_missed():
-            if (today, reminder.id) not in self._reported_missed:
-                self._reported_missed.add((today, reminder.id))
-                alert = f"No response to the reminder '{reminder.text}' after several tries today."
-                self.memory.log_event("alert", alert)
-                if self.family:
-                    self.family.send(f"Kin: {alert} It may be worth a call.")
-                log(f"gave up on reminder #{reminder.id} for today; logged an alert")
+        for alert in alerts.report_missed_reminders(self.memory, self.family):  # normally raised by the tool already
+            log(f"alert: {alert}")
 
         if self.family and datetime.now().strftime("%H:%M") >= config.digest_time() and not self._done_today("digest"):
             log("sending the family digest")
-            sent = self.family.send(digest.build(self.memory))
+            note = digest.build(self.memory)
+            sent = self.family.send(note)
+            self.memory.log_event("digest_note", note)  # the weekly trends are built from these short notes
             self.memory.log_event("digest", f"sent to {sent} chat(s)")
+            if datetime.now().strftime("%a").lower() == config.weekly_day():
+                self.family.send("Kin's weekly note\n\n" + nightly.latest_trends(self.memory))
 
-        if datetime.now().strftime("%H:%M") >= CONSOLIDATE_AT and not self._done_today("consolidation"):
-            if self.memory.turns_since(self.memory.last_event_time("consolidation")):
-                log("tidying memory")
-                log("done: " + consolidate(self.memory).summary())
+        if datetime.now().strftime("%H:%M") >= NIGHTLY_AT and not self._done_today("nightly"):
+            log("nightly reflection: memory, weekly trends, self-check")
+            self.memory.log_event("nightly", "started")  # marked first, so a failure is not retried every tick
+            summary = nightly.run_locally(self.memory)
+            log("done: " + summary)
+            for _, kind, detail in self.memory.events_on(datetime.now().date()):
+                if kind == "self_check" and detail.startswith("[high]"):
+                    log("SELF-CHECK " + detail)
         return False
 
     def run(self) -> None:
         log(f"Kin service: mouth={config.mouth()} ears={config.ears()} check-in at {config.checkin_time()} "
             f"family={'on, ' + str(len(config.family_chat_ids())) + ' chat(s)' if self.family else 'off'}")
+        for name, (in_env, in_file) in config.overridden().items():
+            log(f"note: {name}={in_env} comes from the environment and overrides .env ({in_file or 'empty'})")
         if self.family:
             self.family.start()
+        if config.gateway_port():
+            try:
+                gateway.start()
+                wirepod.IntentWatcher()
+                log(f"gateway on 127.0.0.1:{config.gateway_port()} for speech wire-pod does not recognise; "
+                    "watching Vector's built-in commands")
+            except OSError as e:
+                log(f"gateway not started: {e}")
+        down_since: float | None = None
         while True:
             try:
                 with kin_robot.connect(take_control=False) as robot:
-                    agent = Agent(robot, self.memory, voice.make_mouth(robot), self.ears, self.family)
-                    log("connected to Vector")
-                    while True:
-                        if self.tick(robot, agent) and self.once:
-                            return
-                        time.sleep(1.0)
+                    kin_robot.call(robot.get_battery_state, timeout=10)  # a robot that connects but will not answer is not up
+                    down_since = None
+                    if note := alerts.report_robot_back(self.memory, self.family):
+                        log(note)
+                    self._touch = kin_robot.TouchWatcher(robot)
+                    agent = Agent(robot, self.memory, voice.make_mouth(robot), self.ears, self.family,
+                                  attention=self._touch.petted)
+                    self._faces = kin_robot.FaceWatcher(robot)
+                    self._next_heartbeat = 0.0
+                    kin_robot.hold_idle(robot)
+                    log("connected to Vector" + (", holding him between tasks" if config.idle_hold() else ""))
+                    try:
+                        while True:
+                            if self.tick(robot, agent) and self.once:
+                                return
+                            time.sleep(0.5)
+                    finally:
+                        self._touch.stop()
+                        self._faces.stop()
             except KeyboardInterrupt:
                 log("stopping")
                 return
             except Exception as e:  # a dropped link or a bad task must not end the service
-                log(f"error: {type(e).__name__}: {e}; reconnecting in {RECONNECT_SECONDS}s")
+                where = " <- ".join(f"{f.name}:{f.lineno}" for f in traceback.extract_tb(e.__traceback__)[-3:][::-1])
+                log(f"error: {type(e).__name__}: {str(e)[:120]} (at {where}); reconnecting in {RECONNECT_SECONDS}s")
+                down_since = down_since or time.monotonic()
+                minutes = (time.monotonic() - down_since) / 60
+                if minutes >= ROBOT_DOWN_MINUTES:
+                    if alert := alerts.report_robot_down(self.memory, self.family, minutes):
+                        log(f"alert: {alert}")
                 time.sleep(RECONNECT_SECONDS)
 
 
 if __name__ == "__main__":
-    Service(Memory(), checkin_now="--checkin-now" in sys.argv, once="--once" in sys.argv).run()
+    Service(
+        Memory(),
+        checkin_now="--checkin-now" in sys.argv,
+        once="--once" in sys.argv,
+        presence_now="--presence-now" in sys.argv,
+    ).run()

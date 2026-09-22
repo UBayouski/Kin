@@ -1,12 +1,14 @@
 """Robot actions exposed to the LLM as tools."""
 
 import json
+import re
 import time
+from typing import Callable
 
 import anki_vector
 from anki_vector.util import degrees, distance_mm, speed_mmps
 
-from kin import config, family, llm, search
+from kin import alerts, config, family, llm, search, weather
 from kin import robot as kin_robot
 from kin.memory import Memory
 from kin.robot import call
@@ -15,6 +17,11 @@ from kin.voice import ConsoleEars, Ears, Mouth, VectorMouth
 MAX_DRIVE_MM = 150
 MAX_TURN_DEG = 180
 HEAD_UP_DEG = 35
+NO_REPLY = "no reply heard"  # what `ask` returns when nobody answered
+REPLIED = "the person replied: "  # and how its result begins when somebody did
+# With the reason: a bare "please put me on my charger" from a fully charged robot sounded like a fault.
+ASK_FOR_A_LIFT = ("Ask the person, once and politely, to put you on it, and say why: you cannot get back to it "
+                  "by yourself. Do not mention your battery unless it is low.")
 
 # Friendly names the model may use, mapped to SDK animation triggers.
 ANIMATIONS = {
@@ -112,6 +119,12 @@ TOOL_SPECS = [
         ["fact_id"],
     ),
     _spec(
+        "weather",
+        "Current weather plus today's and tomorrow's forecast, from a forecast service. Always use this for "
+        "weather, never `web_search` and never your own knowledge. Say the temperature with its unit.",
+        {"place": {"type": "string", "description": "Town or city; leave empty for where the person lives"}},
+    ),
+    _spec(
         "set_reminder",
         "Set a repeating nudge, e.g. pills, water, a walk. You will be woken at that time to go and ask the person. "
         "Confirm the time with the person before setting it.",
@@ -139,9 +152,10 @@ TOOL_SPECS = [
 
 WEB_SEARCH_SPEC = _spec(
     "web_search",
-    "Search the live web for current facts: weather, news, TV listings, opening hours, sports results, or whether "
+    "Search the live web for current facts: news, TV listings, opening hours, sports results, or whether "
     "a message or phone call matches a known scam. Never answer such questions from memory. Include the person's "
-    "town in the query when the answer depends on where they live.",
+    "town in the query when the answer depends on where they live. Not for weather: use `weather`. Be wary of "
+    "numbers and units in results; if a figure looks implausible, say you are not sure rather than repeat it.",
     {
         "query": {"type": "string"},
         "topic": {"type": "string", "enum": ["general", "news"], "description": "'news' for recent events"},
@@ -174,10 +188,41 @@ def _clamp(value: float, limit: float) -> float:
     return max(-limit, min(limit, float(value)))
 
 
+# The weather tool gives the planner words ("degrees Fahrenheit") and it writes symbols anyway; the voice
+# then read "62°F" as "62 E F". Whatever is spoken goes through here, so no symbol reaches the voice.
+_SPOKEN_UNITS = [
+    (re.compile(r"\s*°\s*F\b"), " degrees Fahrenheit"),
+    (re.compile(r"\s*°\s*C\b"), " degrees Celsius"),
+    (re.compile(r"\s*°"), " degrees"),
+    (re.compile(r"(?<=\d)\s*%"), " percent"),
+    (re.compile(r"(?<=\d)\s*mph\b"), " miles per hour"),
+    (re.compile(r"(?<=\d)\s*km/h\b"), " kilometres per hour"),
+]
+
+
+def is_echo(question: str, reply: str) -> bool:
+    """Did the microphone only catch the tail of Kin's own question? Live, "Could you please place me on my
+    charger?" got the reply "charger." from the room's echo, and Kin thanked a person who was not there.
+    A reply of one or two words, all of them from the question, is not an answer."""
+    words = re.findall(r"[a-z']+", reply.lower())
+    asked = set(re.findall(r"[a-z']+", question.lower()))
+    return 0 < len(words) <= 2 and all(word in asked for word in words)
+
+
+def for_speech(text: str) -> str:
+    """Text as the voice should get it: unit symbols spelled out, odd spaces made plain."""
+    for symbol, words in _SPOKEN_UNITS:
+        text = symbol.sub(words, text)
+    return " ".join(text.split())
+
+
 class RobotTools:
     def __init__(self, robot: anki_vector.Robot, memory: Memory, mouth: Mouth | None = None, ears: Ears | None = None,
-                 family_link: "family.Family | None" = None):
+                 family_link: "family.Family | None" = None, attention: Callable[[], bool] | None = None):
         self.robot = robot
+        # Returns True once when the person pets Vector. Slow moves poll it and stop, so a two-minute
+        # docking attempt no longer makes him deaf to the person standing next to him.
+        self.attention = attention
         self.memory = memory
         self.family = family_link
         self.mouth = mouth or VectorMouth(robot)
@@ -191,25 +236,43 @@ class RobotTools:
         try:
             args = json.loads(arguments) if arguments else {}
             return kin_robot.with_retry(lambda: handler(**args))
+        except kin_robot.Interrupted:
+            return ("interrupted: the person just petted you to get your attention. Drop what you were doing, "
+                    "greet them and ask what they need.")
         except Exception as e:  # the model gets to see the failure and react
             return f"error: {type(e).__name__}: {e}"
+
+    def _docked_to_stay(self) -> bool:
+        return config.stay_on_charger() and self.robot.status.is_on_charger
 
     def _leave_charger(self) -> None:
         if self.robot.status.is_on_charger:
             call(self.robot.behavior.drive_off_charger)
 
     def _tool_say(self, text: str) -> str:
-        self.mouth.say(text)
-        self.memory.log_turn("kin", text)
+        # The planner keeps putting questions in `say` despite its instructions. Live, a check-in said "How
+        # did you sleep?" and then asked it again with `ask`, and later said "How are you feeling today?" to
+        # nobody listening. A question is a question: whatever tool it came through, he listens for the answer.
+        if text.rstrip().endswith("?"):
+            return self._tool_ask(text)
+        self._speak(text)
         return "said"
 
+    def _speak(self, text: str) -> None:
+        text = for_speech(text)
+        self.mouth.say(text)
+        self.memory.log_turn("kin", text)
+
     def _tool_ask(self, question: str) -> str:
-        self._tool_say(question)
-        reply = self.ears.listen()
-        if not reply:
-            return "no reply heard"
+        if prepare := getattr(self.ears, "prepare", None):
+            prepare()  # microphone open before he speaks, so a prompt answer is not clipped; `listen` closes it
+        self._speak(question)
+        with kin_robot.animating(self.robot, "VC_ListeningLoop"):  # his own "I'm listening" look
+            reply = self.ears.listen()
+        if not reply or is_echo(question, reply):
+            return NO_REPLY
         self.memory.log_turn("person", reply)
-        return f"the person replied: {reply}"
+        return REPLIED + reply
 
     def _tool_set_reminder(self, text: str, time_of_day: str, days: str = "daily") -> str:
         reminder_id = self.memory.add_reminder(text, time_of_day, days)
@@ -223,6 +286,8 @@ class RobotTools:
 
     def _tool_reminder_outcome(self, reminder_id: int, outcome: str) -> str:
         self.memory.log_reminder(int(reminder_id), outcome)
+        if alerts.report_missed_reminders(self.memory, self.family):
+            return "logged; that was the last try for today, and the family has been told"
         return "logged"
 
     def _tool_remember(self, fact: str, date: str | None = None) -> str:
@@ -238,6 +303,9 @@ class RobotTools:
         self.memory.log_event("family_out", message)
         return f"sent to {sent} family member(s)" if sent else "error: the message could not be sent"
 
+    def _tool_weather(self, place: str = "") -> str:
+        return weather.report(place)
+
     def _tool_web_search(self, query: str, topic: str = "general") -> str:
         if not search.available():
             return "error: web search is not set up"
@@ -249,6 +317,11 @@ class RobotTools:
         return "updated" if found else f"error: there is no fact #{fact_id}"
 
     def _tool_look_for_face(self) -> str:
+        if self._docked_to_stay():
+            found = kin_robot.quiet_look(self.robot)
+            return ("found a person" if found else
+                    "no one in view from the charger, and you are staying on it. They may well be in the room: "
+                    "call out with `ask`.")
         self._leave_charger()
         call(self.robot.behavior.set_head_angle, degrees(HEAD_UP_DEG), timeout=10)
         for _ in range(8):
@@ -259,7 +332,7 @@ class RobotTools:
                     name = next((f.name for f in faces if f.name), "")
                     return f"found a person, name: {name}" if name else "found a person, name unknown"
                 time.sleep(0.2)
-            call(self.robot.behavior.turn_in_place, degrees(45), timeout=15)
+            call(self.robot.behavior.turn_in_place, degrees(45), timeout=15, interrupt=self.attention)
         return "no one found after a full turn"
 
     def _tool_describe_scene(self, question: str) -> str:
@@ -271,15 +344,20 @@ class RobotTools:
         return llm.describe_image(kin_robot.take_photo(self.robot), prompt, max_tokens=120)
 
     def _tool_turn(self, degrees: float) -> str:  # noqa: A002 - name is the tool's argument
+        if self._docked_to_stay():
+            return "staying on the charger, so not turning. You can still talk and listen from here."
         self._leave_charger()
         angle = _clamp(degrees, MAX_TURN_DEG)
-        call(self.robot.behavior.turn_in_place, anki_vector.util.degrees(angle), timeout=20)
+        call(self.robot.behavior.turn_in_place, anki_vector.util.degrees(angle), timeout=20, interrupt=self.attention)
         return f"turned {angle:.0f} degrees"
 
     def _tool_drive(self, distance_mm: float) -> str:  # noqa: A002
+        if self._docked_to_stay():
+            return "staying on the charger, so not driving. You can still talk and listen from here."
         self._leave_charger()
         dist = _clamp(distance_mm, MAX_DRIVE_MM)
-        call(self.robot.behavior.drive_straight, anki_vector.util.distance_mm(dist), speed_mmps(60), timeout=20)
+        call(self.robot.behavior.drive_straight, anki_vector.util.distance_mm(dist), speed_mmps(60), timeout=20,
+             interrupt=self.attention)
         return f"drove {dist:.0f} mm"
 
     def _tool_play_animation(self, name: str) -> str:
@@ -292,5 +370,12 @@ class RobotTools:
     def _tool_go_home(self) -> str:
         if self.robot.status.is_on_charger:
             return "already on the charger"
-        call(self.robot.behavior.drive_on_charger, timeout=120)
-        return "on the charger" if self.robot.status.is_on_charger else "could not reach the charger"
+        if not kin_robot.charger_in_view(self.robot, self.attention):
+            return "cannot see the charger from here. " + ASK_FOR_A_LIFT
+        try:
+            call(self.robot.behavior.drive_on_charger, timeout=60, interrupt=self.attention)
+        except TimeoutError:
+            pass  # the result below says whether he made it
+        if self.robot.status.is_on_charger:
+            return "on the charger"
+        return "could not get onto the charger. " + ASK_FOR_A_LIFT

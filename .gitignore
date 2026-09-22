@@ -9,4 +9,5 @@ captures/
 *.db
 .claude/settings.local.json
 data/
+docs/
 CLAUDE.md

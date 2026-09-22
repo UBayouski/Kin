@@ -1,7 +1,12 @@
 """Tool-calling agent loop: Nemotron plans, Vector acts."""
 
+import json
+import re
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from typing import Callable
 
 import anki_vector
 
@@ -9,10 +14,29 @@ from kin import config, family, llm, search
 from kin import robot as kin_robot
 from kin.family import Family
 from kin.memory import Memory
-from kin.tools import RobotTools, tool_specs
+from kin.tools import NO_REPLY, REPLIED, RobotTools, tool_specs
 from kin.voice import Ears, Mouth
 
 MAX_STEPS = 24  # a check-in is a conversation: several ask/remember rounds
+PLANNER_TIMEOUT = 30  # seconds per planner call; one retry, so a minute at worst before Kin gives up
+LOST_TRAIN_OF_THOUGHT = "Sorry, I've lost my train of thought. Let's talk again in a little while."
+
+# After these the person is not waiting on Kin: he has just spoken, left, or finished some bookkeeping. The
+# next planner call is usually only his private closing summary, and a "thinking" show there looks like
+# he has started working on something again after the conversation ended.
+QUIET_AFTER = {"say", "go_home", "notify_family", "reminder_outcome", "play_animation", "remember", "update_fact",
+               "set_reminder", "cancel_reminder", "ask (unanswered)"}
+
+# Quick, silent steps: he neither speaks nor moves, so from the outside he is still just thinking. The
+# thinking animation carries on straight through them into the next planner call. Without this a simple
+# question played the whole think-and-stop routine twice: once to pick the lookup, once to word the answer.
+SILENT_STEPS = {"weather", "web_search", "recall", "remember", "update_fact", "set_reminder", "list_reminders",
+                "cancel_reminder", "reminder_outcome", "notify_family"}
+
+
+def thinking_continues(tool_names: list[str]) -> bool:
+    """Should the thinking animation stay on through these tool calls?"""
+    return bool(tool_names) and all(name in SILENT_STEPS for name in tool_names)
 
 SYSTEM_PROMPT = """\
 You are Kin, a small tabletop robot companion for an older adult who lives alone. \
@@ -23,16 +47,25 @@ How you work:
 Keep each utterance to one or two short sentences.
 - You act only through tools. Do one step at a time and look at each result before the next.
 - To ask something, use `ask`: it speaks the question and returns their spoken reply. `say` never listens. \
+Never end a `say` with a question, and never follow a `say` with an `ask` that repeats it. \
 If you get 'no reply heard', ask once more, a little differently, then let it be.
+- When the person agrees to something you offered, do it and then tell them it is done, in a few words \
+("Done, I've noted that."). Acting silently leaves them wondering whether you heard.
 - If you need to talk to someone face to face, find them first with `look_for_face`.
 - If `look_for_face` finds no one, do not wander about looking. Call out with `ask` ("Hello, are you \
 there?"); they may be close by but out of view, and you can talk without seeing them.
-- If `go_home` cannot reach the charger, ask the person once, politely, to put you on it. Do not keep trying.
+- If `go_home` cannot see or reach the charger, ask the person once, politely, to put you on it. Do not \
+call `go_home` again in the same task.
+- If a tool result says you were interrupted, the person wants you now: stop the errand and attend to them.
 - Messages in [square brackets] come from your own schedule, not from the person. Follow them.
 - Tool results (what you saw, what you found) are known only to you. If the person asked to be \
 told something, you must `say` it before you finish.
-- When the task is finished, reply with a one-line plain-text summary of what happened. \
-That summary is a private log entry. The person never hears it.
+- When the task is finished, reply with plain text. If you spoke to the person during the task \
+(`say` or `ask`), that text is a private one-line log entry and they never hear it. If you did NOT \
+speak to them, your closing text is spoken aloud as your reply, so write it as speech: warm, one or \
+two short sentences, addressed to them.
+- Tool errors and technical trouble are yours to deal with quietly. Never mention tools, errors, \
+connections or anything about how you work to the person, unless it means you cannot do what they asked.
 
 Memory:
 - You forget everything between conversations except what you save with `remember`. When the person \
@@ -53,11 +86,13 @@ say so kindly instead of promising.
 
 WEB_SEARCH_RULES = """\
 Web search:
-- For anything that changes (weather, news, TV, opening hours, scores), use `web_search` and answer from \
+- For anything that changes (news, TV, opening hours, scores), use `web_search` and answer from \
 what it returns. Say the one or two facts that matter, in plain words; never read out web addresses.
 - Scam check: if the person describes or shows a message, letter or call asking for money, gift cards, \
-bank details, passwords or urgent action, do these in order. First `say` one calm sentence: do nothing \
-yet, you will look it up. Then you MUST call `web_search` describing the message plus the word scam; \
+bank details, passwords or urgent action, do these in order, as separate tool calls. Step 1, before \
+anything else: `say` one calm sentence such as "Please don't do anything yet, let me look that up." \
+They may be about to pay; this sentence comes first. Step 2: you MUST call `web_search` describing the \
+message plus the word scam; \
 your own knowledge is out of date and new scams appear every week. Then tell them what you found \
 ("I looked it up, and..."). If it matches known scams, say so plainly and tell them not to pay, click \
 or call back. If you find nothing, say you could not confirm it either way. Never tell them a message \
@@ -74,15 +109,48 @@ what it says, `ask` if they want to send anything back, then report to the famil
 """
 
 
+NOTE_TO_SELF = re.compile(
+    r"\b(end of (the )?task|task (is )?(complete|completed|finished|done)|no (further|additional|more) "
+    r"(spoken )?(response|action|output|speech)|nothing (further|more) to (say|do)|closing (text|summary)|"
+    r"log entry|private note|the person (said|replied|answered|confirmed)|no reply (was )?heard)\b", re.IGNORECASE)
+
+
+def speakable(text: str, max_sentences: int = 3) -> str:
+    """Closing text made safe to say aloud, or '' if there is nothing fit to say.
+
+    A fast planner once wrote a malformed tool call as plain text and Kin read the markup out; another
+    time it delivered a 27-second monologue. Whatever the model does, the person hears at most a few
+    plain sentences.
+    """
+    text = text.split("</think>")[-1]  # reasoning that leaked into the reply is never for the person
+    said = re.search(r"<function=say>\s*(.*?)\s*</", text, re.DOTALL)  # rescue the words from a botched `say`
+    if said:
+        text = said.group(1)
+    text = " ".join(text.split())
+    # A note to itself is not speech. Live, "(End of task – no further spoken response.)" was read out
+    # to the person, who had just answered a question and so counted as still waiting.
+    if re.fullmatch(r"[(\[].*[)\]]", text) or NOTE_TO_SELF.search(text):
+        return ""
+    text = re.sub(r"<[^>]*>|[{}\[\]*_`#]", " ", text)
+    text = " ".join(text.split())
+    if not re.search(r"[A-Za-z]{3}", text):
+        return ""
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    return " ".join(sentences[:max_sentences])
+
+
 class Agent:
     def __init__(self, robot: anki_vector.Robot, memory: Memory | None = None, mouth: Mouth | None = None,
-                 ears: Ears | None = None, family_link: Family | None = None, verbose: bool = True):
+                 ears: Ears | None = None, family_link: Family | None = None,
+                 attention: Callable[[], bool] | None = None, verbose: bool = True):
         self.robot = robot
         self.memory = memory or Memory()
-        self.tools = RobotTools(robot, self.memory, mouth, ears, family_link)
+        self.tools = RobotTools(robot, self.memory, mouth, ears, family_link, attention)
         self.verbose = verbose
         self.messages: list[dict] = []
         self._pool = ThreadPoolExecutor(max_workers=1)
+        self._closing = None   # the get-out animation still playing, if any
+        self._thinking = None  # the searching loop, while it is running
         self._animate = self._warm_up_animations()
 
     @staticmethod
@@ -96,12 +164,20 @@ class Agent:
     def _context(self) -> str:
         """What Kin knows going into a request: the time, saved facts and the recent conversation."""
         lines = [f"Now: {datetime.now():%A, %B %d %Y, %H:%M}."]
+        if config.person_name():
+            lines.append(f"The person you live with is {config.person_name()}. Use their name, also when writing to family.")
         if config.home_location():
             lines.append(f"The person lives in {config.home_location()}.")
         facts = self.memory.active_facts(limit=15)
         if facts:
             lines.append("\nFacts you have saved (newest first, # is the id for `update_fact`):")
             lines += [f"- {fact.render()}" for fact in facts]
+        with_vector = [(ts, detail) for ts, kind, detail in self.memory.events_on(datetime.now().date())
+                       if kind == "vector_intent"][-6:]
+        if with_vector:
+            lines.append("\nToday the person also dealt with Vector directly, and he reacted in his own way "
+                         "(you did not handle these; mention them only if it is natural):")
+            lines += [f"- [{ts[11:16]}] {detail}" for ts, detail in with_vector]
         turns = self.memory.recent_turns()
         if turns:
             lines.append("\nLatest conversation:")
@@ -109,70 +185,149 @@ class Agent:
         return "\n".join(lines)
 
     def _warm_up_animations(self) -> bool:
-        """The trigger list is a slow download over Wi-Fi; fetch it up front, and do without it if it fails."""
+        """The animation lists are slow downloads over Wi-Fi; fetch them up front, and do without if it fails.
+
+        Both lists, not only the triggers: the SDK loads whichever is missing before it plays anything, so
+        with the big animation list left out the first thinking animation of the day waited for that
+        download and never showed (seen live: a 9.6 s planner call with no sign he was working)."""
         for _ in range(3):
             try:
-                if self.robot.anim.anim_trigger_list:
+                if self.robot.anim.anim_trigger_list and self.robot.anim.anim_list:
                     return True
             except anki_vector.exceptions.VectorException:
                 continue
         self._log("  (animation list unavailable, thinking animation disabled)")
         return False
 
-    def _play_thinking(self, first: bool) -> None:
-        if not self._animate:
+    def _start_thinking(self) -> None:
+        if self._thinking is None:
+            self._thinking = kin_robot.animating(self.robot, "KnowledgeGraphSearching")
+            self._thinking.__enter__()
+
+    def _stop_thinking(self) -> None:
+        """Close the searching loop with its own get-out animation, while we still hold control.
+
+        The loop carries his "processing" sound and does not end by itself. Left open, it kept playing
+        after the task finished and control had been released, with nothing able to stop it.
+
+        Started without waiting: measured live, waiting for it cost up to 5 s before Kin could answer.
+        `run` gives it a moment to finish before control is handed back at the end of the task.
+        """
+        if self._thinking is None:
             return
-        trigger = "KnowledgeGraphSearchingGetIn" if first else "KnowledgeGraphSearching"
+        self._thinking.__exit__(None, None, None)  # cancels the loop
+        self._thinking = None
         try:
-            kin_robot.call(self.robot.anim.play_animation_trigger, trigger, timeout=8)
-        except (anki_vector.exceptions.VectorException, TimeoutError):
+            self._closing = self.robot.anim.play_animation_trigger(
+                "KnowledgeGraphSearchingGetOutSuccess", ignore_body_track=True, _return_future=True)
+        except Exception:
             pass  # cosmetic; never let it break a request
+
+    def warm_up(self) -> None:
+        """Prime the planner in the background. The first call of a task pays about a second that later
+        calls do not (the long fixed prompt and tool list are cached after it), so the service calls
+        this the moment a pet registers, while Vector is still reacting to the touch."""
+        def prime():
+            try:
+                llm.client().chat.completions.create(
+                    model=config.planner_model(), max_tokens=1, tools=tool_specs(),
+                    messages=[{"role": "system", "content": self._system_prompt()}, {"role": "user", "content": "hello"}],
+                )
+            except Exception:
+                pass
+        threading.Thread(target=prime, daemon=True, name="Planner warm-up").start()
+
+    def _let_thinking_close(self) -> None:
+        if self._closing is not None:
+            try:
+                self._closing.result(timeout=2)
+            except Exception:
+                pass
+            self._closing = None
 
     def _log(self, text: str) -> None:
         if self.verbose:
             print(text, flush=True)
 
     def _complete(self):
-        return llm.client().chat.completions.create(
+        extra = {} if config.planner_thinking() else {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+        # A stalled request must not hold the person: the longest healthy call seen is under 10 s.
+        return llm.client().with_options(timeout=PLANNER_TIMEOUT, max_retries=1).chat.completions.create(
             model=config.planner_model(),
             messages=self.messages,
             tools=tool_specs(),
             max_tokens=800,
+            **extra,
         )
 
-    def _think(self):
-        """Call the planner while Vector plays his searching animation, so the wait looks intentional."""
+    def _think(self, someone_is_waiting: bool = True):
+        """Call the planner; if it takes a moment and someone is waiting on him, Vector plays his searching
+        animation so the wait looks intentional. The animation never delays the answer (it loops in the
+        background), and it is `_loop` that decides when it ends: not between a lookup and the next
+        thought, only when he is about to speak, move or finish."""
+        started = time.perf_counter()
         pending = self._pool.submit(self._complete)
-        first = True
-        while not pending.done():
-            try:
-                pending.result(timeout=0.4)
-            except TimeoutError:
-                self._play_thinking(first)
-                first = False
-        return pending.result()
+        try:
+            result = pending.result(timeout=0.7)  # a quick answer needs no show
+        except TimeoutError:
+            if self._animate and someone_is_waiting:
+                self._start_thinking()
+            result = pending.result()
+        self._log(f"  (planner {time.perf_counter() - started:.1f}s)")
+        return result
 
-    def run(self, user_text: str, speaker: str = "person") -> str:
+    def run(self, user_text: str, speaker: str = "person", note: str = "") -> str:
         """Handle one request end to end. Returns the agent's closing summary.
 
         `speaker` is who the text comes from: 'person', 'family', or 'system' for the service's own
         triggers (a check-in, a due reminder), which are instructions rather than something anyone said.
+        `note` is extra context for this one request (how it reached Kin); it is not logged as speech.
         """
         # Every request starts from memory rather than a growing transcript, so a restart loses nothing.
         self.messages = [
-            {"role": "system", "content": self._system_prompt() + "\n" + self._context()},
+            {"role": "system", "content": self._system_prompt() + "\n" + self._context() + (f"\n\n{note}" if note else "")},
             {"role": "user", "content": user_text},
         ]
         if speaker != "system":
             self.memory.log_turn(speaker, user_text)
+        turns_before = len(self.memory.turns_on(datetime.now().date()))
         with kin_robot.control(self.robot):
-            summary = self._loop()
+            try:
+                summary, last_tool = self._loop(engaged=speaker == "person")
+            finally:
+                self._stop_thinking()  # whatever happened, never hand him back with the sound still looping
+            kin_spoke = any(who == "kin" for _, who, _ in self.memory.turns_on(datetime.now().date())[turns_before:])
+            # Safety net: the planner sometimes writes its answer as closing text instead of calling `say`.
+            # If someone is still waiting on him (a person asked and no tool has run; or the last step was a
+            # lookup or the person's reply to a question), that text IS the answer, so say it. After he has
+            # just spoken or tidied up, the closing text is only his private log line.
+            # A person who started the conversation and has heard nothing at all is also still waiting.
+            waiting = (bool(last_tool) and last_tool not in QUIET_AFTER) or (speaker != "system" and not kin_spoke)
+            if waiting and not summary.startswith("stopped:"):
+                if words := speakable(summary):
+                    self._log("  (the answer came as closing text; saying it)")
+                    self.tools.dispatch("say", json.dumps({"text": words}))
+            self._let_thinking_close()
         self.memory.log_event("task", summary)
         return summary
 
-    def _loop(self) -> str:
+    def _loop(self, engaged: bool = True) -> tuple[str, str]:
+        """Returns the closing text and the name of the last tool that ran ('' if none did).
+
+        `engaged` is whether a person is in the conversation yet. In a task Kin starts himself (a check-in,
+        a reminder) nobody is, until someone answers him: live, the 09:00 check-in played his thinking show
+        twice, sound and all, before his first word, once to decide to look around and once to call out."""
+        last_tool = ""
         for _ in range(MAX_STEPS):
-            message = self._think().choices[0].message
+            waiting = engaged and last_tool not in QUIET_AFTER
+            try:
+                message = self._think(someone_is_waiting=waiting).choices[0].message
+            except Exception as e:  # the planner is unreachable or stalled: end the task, and say so if
+                self._stop_thinking()  # someone is in the conversation, rather than leave them hanging
+                self._log(f"  (planner failed: {type(e).__name__}: {str(e)[:100]})")
+                if engaged:
+                    self.tools.dispatch("say", json.dumps({"text": LOST_TRAIN_OF_THOUGHT}))
+                return f"stopped: planner unavailable ({type(e).__name__})", "say" if engaged else last_tool
             entry: dict = {"role": "assistant", "content": message.content or ""}
             if message.tool_calls:
                 entry["tool_calls"] = [
@@ -185,12 +340,27 @@ class Agent:
                 ]
             self.messages.append(entry)
 
+            # He stops looking thoughtful only when he is about to speak, move or finish; a quick silent
+            # lookup in between is still part of the same thought.
+            if not thinking_continues([c.function.name for c in message.tool_calls or []]):
+                self._stop_thinking()
+
             if not message.tool_calls:
-                return message.content or ""
+                return (message.content or "").split("</think>")[-1].strip(), last_tool
 
             for call in message.tool_calls:
                 self._log(f"  -> {call.function.name}({call.function.arguments})")
                 result = self.tools.dispatch(call.function.name, call.function.arguments)
                 self._log(f"  <- {result}")
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-        return "stopped: too many steps"
+                # Nobody answered, so nobody is waiting: "Anything else?" met by silence ends the conversation
+                # quietly, and the closing text stays a private log line instead of being said to an empty room.
+                # Judged by the result, not the tool's name: a `say` that ended in a question listens too.
+                if result == NO_REPLY:
+                    last_tool = "ask (unanswered)"
+                elif result.startswith(REPLIED):
+                    last_tool, engaged = "ask", True
+                else:
+                    last_tool = call.function.name
+        self._stop_thinking()
+        return "stopped: too many steps", last_tool
