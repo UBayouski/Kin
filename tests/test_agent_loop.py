@@ -268,3 +268,20 @@ def test_a_stalled_planner_before_anyone_answered_stays_silent(memory):
 
     assert agent.run("[Reminder #1 is due.]", speaker="system").startswith("stopped: planner unavailable")
     assert mouth.said == [], "nobody was in the conversation yet; a robot talking to an empty room is worse than silence"
+
+
+def test_a_reply_to_a_spoken_closing_question_carries_the_conversation_on(memory):
+    """Sep 23, 09:15: "...Do you need anything else?" came as closing text, was said (a closing question
+    listens), the person answered, and the answer was dropped."""
+    agent, mouth, _ = make_agent(memory, [
+        reply(content="It's 59 and clear. Do you need anything else?"),
+        reply(tool_call("ask", question="Sure, what would you like to know?")),
+        reply(content="Okay, I'm here if you need me."),
+    ], ears=["Yes, one more thing.", "Nothing, never mind."])
+
+    agent.run("tell me the weather")
+
+    assert mouth.said == ["It's 59 and clear. Do you need anything else?", "Sure, what would you like to know?",
+                          "Okay, I'm here if you need me."]
+    assert [text for _, who, text in memory.recent_turns() if who == "person"] == \
+        ["tell me the weather", "Yes, one more thing.", "Nothing, never mind."]

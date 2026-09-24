@@ -41,14 +41,13 @@ CHECKIN = (
     "like you were not listening. Ask what they have planned today; when they tell you, say something "
     "about it and work today's weather into that (`weather` tool, one sentence: going out means what to "
     "wear; staying in, just what it is like outside). Save plans and anything else worth keeping. "
-    "Keep it to a few exchanges. To close, `ask` once whether there is anything you can do for them; help "
-    "if there is. If they say no, finish, and make your closing text a warm wish for the day in a few "
-    "words; it is spoken. If no reply is heard, just finish."
+    "Keep it to a few exchanges. Your remark about their plans and the weather is the last one: put the "
+    "offer of more in the same `ask`, as always, and after their no, wish them a good day."
 )
 PRESENCE_CHECK = (
     "[You have not seen or heard the person yet today and it is getting late in the morning. Look for them, "
     "then call out once with `ask`, warmly, to check they are there. If they answer, have a short friendly "
-    "exchange. If there is no answer, do not keep calling. Do not go home and do not message the family "
+    "exchange and close as always. If there is no answer, do not keep calling. Do not go home and do not message the family "
     "yourself: both are handled for you as soon as you finish.]"
 )
 LOW_BATTERY = (
@@ -57,21 +56,21 @@ LOW_BATTERY = (
     "tell from their words whether they have done it: thank them and finish, and never say you are charging.]"
 )
 STRANDED_MINUTES = 10  # low and off the charger this long, and the family is told
+GAUGE_UNREADABLE_MINUTES = 10  # off the charger with no real battery reading this long, and he asks to be put on it
+GAUGE_UNREADABLE = (
+    "[You are off your charger and you cannot read your own battery, so you may run flat without warning. "
+    "Ask the person, once and politely, to put you on your charger to be safe. Do not mention your battery "
+    "being low; you do not know. Thank them and finish.]"
+)
 BODY_LOST_MINUTES = 5  # his body board silent this long, and the family is told
+OFF_DOCK_GRACE_SECONDS = 120     # off the charger this long with nothing to do, and he tries to get back
+RETURN_HOME_EVERY_SECONDS = 1800  # and again no sooner than this if it failed (each try is a slow turn)
 ACK_SECONDS = 3.5      # how long Vector needs to say "On it!" himself before Kin takes over
 HEARD_STALE_MINUTES = 3
 TOUCHED = (
     "[The person petted your back to get your attention. Greet them and ask what they need in ONE `ask` "
     "call, for example 'Hello Jennie, what can I do for you?'. Do not `say` a greeting first: that makes "
-    "two questions in a row. Then help with whatever they say. "
-)
-# How a conversation the person started carries on: one open door after each answer, and silence closes it.
-ANYTHING_ELSE = (
-    "When you have answered or done what they asked, `ask` once, briefly, whether there is anything else "
-    "(\"Anything else?\"). If they want something more, help and ask again. If they say no, the conversation "
-    "is over: finish, and make your closing text a sign-off of a few words (\"Okay, I'm here if you need "
-    "me.\"); it is spoken. If no reply is heard, they have walked away: do not ask a second time, do not "
-    "`say` anything more, just finish."
+    "two questions in a row. Then help with whatever they say."
 )
 
 
@@ -87,7 +86,10 @@ def reminder_prompt(reminder: Reminder, attempt: int) -> str:
     return (
         f"[Reminder #{reminder.id} is due: '{reminder.text}' (set for {reminder.time_of_day}).{again} "
         "Find the person, then `ask` them about it in a warm, natural way. Record the result with "
-        "`reminder_outcome`: confirmed, declined, or no_response if you cannot find them or get no answer."
+        "`reminder_outcome`: confirmed, declined, or no_response if you cannot find them or get no answer. "
+        "If they answered, a few warm words back and the offer of more go in one `ask`, as always (\"Lovely, "
+        "well done. Do you need anything else?\" / \"All right, another time. Anything else I can do?\"): "
+        "silence after their answer sounds like you did not hear them."
         + going_home() + "]"
     )
 
@@ -114,8 +116,16 @@ class Service:
         self._next_heartbeat = 0.0
         self._battery: tuple[str, bool] | None = None
         self._volts = 0.0
-        self._warmed_for: int | None = None  # the heard request the planner was last warmed up for
+        self._warmed_for: int | str | None = None  # the heard request (or "checkin") the planner was last warmed up for
         self._body_lost_since: float | None = None
+        self._off_dock_since: float | None = None
+        self._gauge_trusted = True
+        self._gauge_stale_since: float | None = None
+        self._last_gauge_plea = float("-inf")
+        self._body_rechecked = False  # a silent body is believed only after a look over a fresh connection
+        self._last_return_home = float("-inf")
+        self._intents: wirepod.IntentWatcher | None = None
+        self._last_moving = float("-inf")
 
     # --- what is due ----------------------------------------------------------------------------------------------
 
@@ -127,6 +137,14 @@ class Service:
         if self.checkin_now:
             return True
         return datetime.now().strftime("%H:%M") >= config.checkin_time() and not self._done_today("checkin")
+
+    def _warm_up_for_checkin(self, agent: Agent) -> None:
+        """Prime the planner in the minute before the check-in: its first call is the slow one (8.4 s live)."""
+        hh, mm = (int(part) for part in config.checkin_time().split(":"))
+        seconds_to_go = (datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0) - datetime.now()).total_seconds()
+        if 0 < seconds_to_go <= 60 and self._warmed_for != "checkin" and not self._done_today("checkin"):
+            self._warmed_for = "checkin"
+            agent.warm_up()
 
 
     # --- one pass -------------------------------------------------------------------------------------------------
@@ -243,18 +261,66 @@ class Service:
         # On Sep 20 he ran flat and went dark four minutes after the firmware's own "low" flag, so the
         # voltage is watched as well.
         # Two readings in a row, because one can lie: right after a boot he reported "full" at 3.61 V.
-        body_lost = self._watch_body(
-            battery.battery_level == 3 and battery.battery_volts < 3.7  # worth a second of touch samples?
-            and kin_robot.body_silent(battery.battery_level, battery.battery_volts, kin_robot.touch_samples(robot)))
+        silent = (battery.battery_level == 3 and battery.battery_volts < 3.7  # worth a second of touch samples?
+                  and kin_robot.body_silent(battery.battery_level, battery.battery_volts, kin_robot.touch_samples(robot)))
+        if silent and not self._body_rechecked:
+            # The touch readings come over this connection's event stream, and a stream that died quietly
+            # shows the same frozen value as a dead body (Sep 23, 06:29: a false alert, the robot fine on
+            # a fresh connection). So the first sighting is re-checked over a new connection.
+            self._body_rechecked = True
+            raise RuntimeError("body looks silent; reconnecting to check over a fresh link")
+        if not silent:
+            self._body_rechecked = False
+        body_lost = self._watch_body(silent)
         # With his body silent the battery figures are stale, so they say nothing about running flat.
-        low_now = ((level == "low" or battery.battery_volts < 3.65) and not battery.is_on_charger_platform
-                   and not body_lost)
+        gauge_read = kin_robot.gauge_read(battery, self._volts, getattr(getattr(robot, "status", None), "is_on_charger", None))
+        if not gauge_read and self._gauge_trusted:
+            log(f"battery telemetry stale ({battery.battery_volts:.2f} V pinned, or the charger state disagrees "
+                "with the robot's status); not acting on it")
+        self._gauge_trusted = gauge_read
+        if gauge_read:
+            self._gauge_stale_since = None
+        elif self._gauge_stale_since is None:
+            self._gauge_stale_since = now
+        low_now = ((level == "low" or (gauge_read and battery.battery_volts < 3.65))
+                   and not battery.is_on_charger_platform and not body_lost and gauge_read)
         self._low_readings = self._low_readings + 1 if low_now else 0
         self._running_flat = self._low_readings >= 2
+        if battery.is_on_charger_platform or not gauge_read:
+            self._off_dock_since = None
+        elif self._off_dock_since is None:
+            self._off_dock_since = now
+        # A dropped link releases the idle hold, and a request made while the link is still shaky can go
+        # unanswered; live, he wandered off the dock in that gap. So the hold is checked every heartbeat.
+        if config.idle_hold() and not kin_robot.idle_held(robot) and not self._spoken_to() and self._still_for(20):
+            log("holding him again" if kin_robot.hold_idle(robot) else "could not take the idle hold; will retry")
         # Log on any change of level or charger state, and on each 0.05 V step, so the run-up to a reboot is visible.
         if state != self._battery or abs(battery.battery_volts - self._volts) >= 0.05:
             self._battery, self._volts = state, battery.battery_volts
             log(f"battery {level} ({battery.battery_volts:.2f} V), on charger: {battery.is_on_charger_platform}")
+
+    def _spoken_to(self) -> bool:
+        return self._intents is not None and self._intents.spoken_to()
+
+    def _watch_movement(self, robot) -> None:
+        """Note when he last moved or held his cube, so the hold does not cut a fetch short (Sep 23: a fetch
+        stalled mid-carry when the hold came back a minute after the command)."""
+        try:
+            status = robot.status
+            if status.are_motors_moving or status.is_carrying_block:
+                self._last_moving = time.monotonic()
+        except Exception:
+            pass
+
+    def _still_for(self, seconds: float) -> bool:
+        return time.monotonic() - self._last_moving >= seconds
+
+    def _let_him_react(self, robot) -> None:
+        """Drop the idle hold the moment he hears his wake word, so his own reactions ("I love you", a fist
+        bump) can run; the heartbeat takes the hold back a minute after the last thing he heard."""
+        if kin_robot.idle_held(robot) and self._spoken_to():
+            kin_robot.drop_hold(robot)
+            log("spoken to: letting him react; the hold is back in a minute")
 
     def _watch_body(self, silent: bool) -> bool:
         """Follow whether Vector's body board is answering, and tell the family when it has not for a while.
@@ -265,9 +331,10 @@ class Service:
         if not silent:
             if self._body_lost_since is not None:
                 log("his body is answering again")
-                if note := alerts.report_body_back(self.memory, self.family):
-                    log(note)
             self._body_lost_since = None
+            # From memory, not the timer: a restart in between must not leave the family without the all-clear.
+            if note := alerts.report_body_back(self.memory, self.family):
+                log(note)
             return False
         if self._body_lost_since is None:
             self._body_lost_since = now
@@ -301,8 +368,8 @@ class Service:
         note = (f"This request was heard through Vector's own microphone after the wake word or his back button, "
                 f"and he has already answered \"{ack}\" in his own voice. Do not greet or acknowledge again; go "
                 "straight to helping. His microphone is weak, so the words may be garbled: if they make no sense, "
-                "ask the person to say it again. From here on you hear them through a better microphone. "
-                + ANYTHING_ELSE + going_home())
+                "ask the person to say it again. From here on you hear them through a better microphone."
+                + going_home())
         log("done: " + agent.run(text, speaker="person", note=note))
         self.memory.heard_done(heard_id)
         self._forget_touch()  # a hand on his back during the request is not a new request
@@ -311,6 +378,44 @@ class Service:
     def _forget_touch(self) -> None:
         if self._touch is not None:
             self._touch.discard()
+
+    def _return_home(self, robot, agent: Agent) -> bool:
+        """Off the charger with a good battery and nothing to do: drive back onto it, quietly.
+
+        He gets off it by himself in the gaps when the link is down, or is put down somewhere after a
+        restart, and cannot be trusted to find his way back when the battery is finally low: he ran flat
+        that way on Sep 21. Docking works from the table in daylight (twice on Sep 22), so it is tried
+        early instead, once every so often, with no words unless it works."""
+        if not config.stay_on_charger() or self._off_dock_since is None or self._running_flat:
+            return False
+        now = time.monotonic()
+        if now - self._off_dock_since < OFF_DOCK_GRACE_SECONDS or now - self._last_return_home < RETURN_HOME_EVERY_SECONDS:
+            return False
+        self._last_return_home = now
+        log("off the charger with nothing to do: trying to get back onto it")
+        with kin_robot.control(robot):
+            result = agent.tools.dispatch("go_home", "{}")
+        log(f"go home: {result}")
+        if result == "on the charger":
+            self.memory.log_event("task", "drove back onto the charger by himself")
+        return True
+
+    def _guard_unreadable_battery(self, robot, agent: Agent) -> bool:
+        """Off the charger with a gauge that has not given a real reading for a while: ask to be put on it,
+        and tell the family later. Sep 23: the gauge read 0.00 V from a restart at 08:56 until he went dark
+        at 09:44, 40 minutes off the dock, and ignoring the unreadable gauge meant nobody was warned."""
+        if self._gauge_stale_since is None or getattr(getattr(robot, "status", None), "is_on_charger", True):
+            return False
+        minutes = (time.monotonic() - self._gauge_stale_since) / 60
+        if minutes >= GAUGE_UNREADABLE_MINUTES and time.monotonic() - self._last_gauge_plea > 3600:
+            self._last_gauge_plea = time.monotonic()
+            log("battery unreadable and off the charger: asking to be put on it")
+            log("done: " + agent.run(GAUGE_UNREADABLE, speaker="system"))
+            return True
+        if minutes >= 2 * GAUGE_UNREADABLE_MINUTES:
+            if alert := alerts.report_stranded(self.memory, self.family, minutes, reason="with a battery I cannot read"):
+                log(f"alert: {alert}")
+        return False
 
     def _rescue_battery(self, agent: Agent) -> bool:
         """Off the charger with a low battery: get home or get help, before he runs flat."""
@@ -331,8 +436,12 @@ class Service:
 
     def tick(self, robot, agent: Agent) -> bool:
         """Run at most one task. Returns whether one ran."""
+        self._watch_movement(robot)
         self._heartbeat(robot)
+        self._let_him_react(robot)
         if self._rescue_battery(agent):
+            return True
+        if self._guard_unreadable_battery(robot, agent):
             return True
         if self.family and self._handle_family(agent):
             return True
@@ -350,13 +459,16 @@ class Service:
                 return False  # a pet is just a pet: he purrs by himself. Talking starts with "Hey Vector" or his button
             agent.warm_up()
             self._acknowledge_touch(robot)
-            log("done: " + agent.run(TOUCHED + ANYTHING_ELSE + going_home() + "]", speaker="system"))
+            log("done: " + agent.run(TOUCHED + going_home() + "]", speaker="system"))
             self._touch.discard()
             return True
 
         if self._presence(robot, agent):
             return True
+        if self._return_home(robot, agent):
+            return True
 
+        self._warm_up_for_checkin(agent)
         if self._checkin_due():
             self.checkin_now = False
             log("check-in")
@@ -374,7 +486,11 @@ class Service:
             )
             log(f"reminder #{reminder.id} '{reminder.text}' (attempt {attempt})")
             self.memory.log_reminder(reminder.id, "asked")
-            log("done: " + agent.run(reminder_prompt(reminder, attempt), speaker="system"))
+            agent.tools.current_reminder = reminder.id
+            try:
+                log("done: " + agent.run(reminder_prompt(reminder, attempt), speaker="system"))
+            finally:
+                agent.tools.current_reminder = None
             return True  # one task per tick; the next is picked up on the following pass
 
         for alert in alerts.report_missed_reminders(self.memory, self.family):  # normally raised by the tool already
@@ -409,7 +525,7 @@ class Service:
         if config.gateway_port():
             try:
                 gateway.start()
-                wirepod.IntentWatcher()
+                self._intents = wirepod.IntentWatcher()
                 log(f"gateway on 127.0.0.1:{config.gateway_port()} for speech wire-pod does not recognise; "
                     "watching Vector's built-in commands")
             except OSError as e:
@@ -427,8 +543,12 @@ class Service:
                                   attention=self._touch.petted)
                     self._faces = kin_robot.FaceWatcher(robot)
                     self._next_heartbeat = 0.0
-                    kin_robot.hold_idle(robot)
-                    log("connected to Vector" + (", holding him between tasks" if config.idle_hold() else ""))
+                    held = kin_robot.hold_idle(robot)
+                    log("connected to Vector" + (", holding him between tasks" if held else ""))
+                    # A link that dropped mid-task can leave a looped animation (and its sound) running
+                    # with nothing to end it under the hold. A task that does nothing ends it on the way out.
+                    with kin_robot.control(robot):
+                        pass
                     try:
                         while True:
                             if self.tick(robot, agent) and self.once:

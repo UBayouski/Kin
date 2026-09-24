@@ -54,11 +54,11 @@ def connect(take_control: bool = True) -> Iterator[anki_vector.Robot]:
 @contextmanager
 def control(robot: anki_vector.Robot) -> Iterator[None]:
     """Hold behavior control for one task, then give Vector back to himself so he stays alive between tasks."""
-    idle_held = getattr(robot.conn, "behavior_control_level", None) == ControlPriorityLevel.RESERVE_CONTROL
-    if robot.conn.requires_behavior_control and not idle_held:  # connected with control already; nothing to borrow
+    hold_requested = getattr(robot.conn, "behavior_control_level", None) == ControlPriorityLevel.RESERVE_CONTROL
+    if robot.conn.requires_behavior_control and not hold_requested:  # connected with control already; nothing to borrow
         yield
         return
-    if idle_held:
+    if hold_requested:
         _answered(robot, lambda: robot.conn.release_control(timeout=10))  # a request on top of the hold gets no grant
     _answered(robot, lambda: robot.conn.request_control(timeout=15), timeout=15)
     try:
@@ -78,16 +78,32 @@ def control(robot: anki_vector.Robot) -> Iterator[None]:
         hold_idle(robot)
 
 
-def hold_idle(robot: anki_vector.Robot) -> None:
+def hold_idle(robot: anki_vector.Robot) -> bool:
     """Between tasks, keep the light hold that stops Vector's idle behaviours (see config.idle_hold).
-    Best effort: a hold that cannot be taken shows up as the next task's control request, not here."""
+    Returns whether the robot answered the request. A dropped link releases every hold, and a request
+    made while the link is still shaky can go unanswered: live, he wandered off the dock in the gap."""
     if not config.idle_hold():
-        return
-    _answered(robot, lambda: robot.conn.request_control(
+        return False
+    held = _answered(robot, lambda: robot.conn.request_control(
         behavior_control_level=ControlPriorityLevel.RESERVE_CONTROL, timeout=10))
+    robot.kin_idle_held = held  # the SDK records the level as soon as it is asked for, answered or not
+    return held
 
 
-def _answered(robot: anki_vector.Robot, send: Callable[[], Any], timeout: float = 10.0) -> None:
+def drop_hold(robot: anki_vector.Robot) -> None:
+    """Give Vector back to himself for a while (he has been spoken to and may want to react)."""
+    if getattr(robot.conn, "behavior_control_level", None) == ControlPriorityLevel.RESERVE_CONTROL:
+        _answered(robot, lambda: robot.conn.release_control(timeout=10))
+    robot.kin_idle_held = False
+
+
+def idle_held(robot: anki_vector.Robot) -> bool:
+    """Whether the robot answered the last hold request. Not the SDK's level, which is set on asking:
+    a request that went unanswered on a stale link looked held for half an hour (Sep 23)."""
+    return bool(getattr(robot, "kin_idle_held", False))
+
+
+def _answered(robot: anki_vector.Robot, send: Callable[[], Any], timeout: float = 10.0) -> bool:
     """Send a control request or release and wait for the robot's own answer to it.
 
     The SDK's request_control / release_control return before the answer arrives (measured: up to 0.8 s
@@ -108,12 +124,13 @@ def _answered(robot: anki_vector.Robot, send: Callable[[], Any], timeout: float 
     try:
         send()
     except Exception:
-        return
+        return False
     if events is None:  # a stand-in robot in tests
-        return
+        return True
     deadline = time.monotonic() + timeout
     while events.kin_answers == before and time.monotonic() < deadline:
         time.sleep(0.05)
+    return events.kin_answers != before
 
 
 class TouchWatcher:
@@ -205,6 +222,24 @@ def body_silent(level: int, volts: float, touch_values: list[int | None]) -> boo
     impossible_battery = level == 3 and volts < 3.7
     touch_frozen = len(set(touch_values)) <= 1
     return impossible_battery and touch_frozen
+
+
+def gauge_read(battery, previous_volts: float, status_on_charger: bool | None) -> bool:
+    """Is this battery report worth acting on?
+
+    Not when the gauge has not been read: 0.00 V right after a boot (Sep 22), or 3.60 to 3.61 V pinned
+    to the hundredth across readings, which is the placeholder the head reports when it has no fresh
+    figures from the body (Sep 21, and Sep 22 evening: 3.60 V "ok", off the charger for an hour by this
+    report while the robot's own status said on it; it set off the rescue and the stranded alert).
+    A real reading drifts by hundredths. Nor when the two charger-state sources disagree."""
+    volts = battery.battery_volts
+    if volts < 1.0:
+        return False
+    if abs(volts - 3.605) <= 0.01 and abs(volts - previous_volts) < 0.005:
+        return False
+    if status_on_charger is not None and bool(status_on_charger) != bool(battery.is_on_charger_platform):
+        return False
+    return True
 
 
 def touch_samples(robot: anki_vector.Robot, count: int = 20, every: float = 0.05) -> list[int | None]:

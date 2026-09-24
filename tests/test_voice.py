@@ -78,10 +78,59 @@ def test_ask_opens_the_microphone_before_kin_speaks(memory):
     from kin.tools import RobotTools
 
     order = []
-    ears = SimpleNamespace(prepare=lambda: order.append("mic open"), listen=lambda: order.append("listen") or "fine")
+    ears = SimpleNamespace(prepare=lambda: order.append("mic open"), listen=lambda timeout=12.0: order.append("listen") or "fine")
     mouth = SimpleNamespace(say=lambda text: order.append("speak"))
     kit = RobotTools(SimpleNamespace(anim=SimpleNamespace(play_animation_trigger=lambda *a, **k: None)),
                      memory, mouth=mouth, ears=ears)
 
     assert kit.dispatch("ask", '{"question": "How did you sleep?"}') == "the person replied: fine"
     assert order == ["mic open", "speak", "listen"]
+
+
+def test_a_poisoned_noise_floor_cannot_hide_the_persons_voice(monkeypatch):
+    """Sep 23: "No, thank you" at 0.076 went unheard; the floor carried over from earlier noise, sat above
+    her voice, and then adapted towards it."""
+    monkeypatch.setenv("KIN_END_PAUSE", "0.5")
+    ears = make_ears([], [])
+    ears._noise_floor = 0.03  # poisoned
+
+    audio = ears._utterance(iter(blocks_of(*[0.0003] * 5, *[0.07] * 8, *[0.0003] * 10)), timeout=12)
+
+    assert audio is not None, "0.07 is speech in any room"
+    assert ears._noise_floor <= 0.006
+
+
+def test_the_floor_is_measured_afresh_on_each_listen():
+    ears = make_ears(captures=[None], transcripts=[])
+    ears._noise_floor = 0.03
+
+    ears.listen(timeout=1)
+
+    assert ears._noise_floor is None
+
+
+def test_the_tail_of_kins_own_words_is_let_pass_before_listening():
+    """Every capture began with Kin's last words ("Are you there? Yes."): the speaker finishes a little
+    after `say` returns. Blocks are skipped until the room has been quiet for 0.3 s."""
+    import queue
+
+    ears = make_ears([], [])
+    ears._blocks = queue.Queue()
+    for block in blocks_of(0.1, 0.08, 0.05, 0.001, 0.001, 0.001, 0.07):  # tail, quiet, then the person
+        ears._blocks.put(block)
+
+    skipped = ears._skip_speaker_tail()
+
+    assert abs(skipped - 0.6) < 0.01, "three loud blocks and three quiet ones"
+    assert ears._blocks.qsize() == 1, "the person's first block is left for the capture"
+
+
+def test_skipping_the_tail_gives_up_after_a_second_of_noise():
+    import queue
+
+    ears = make_ears([], [])
+    ears._blocks = queue.Queue()
+    for block in blocks_of(*[0.1] * 15):
+        ears._blocks.put(block)
+
+    assert abs(ears._skip_speaker_tail() - 1.0) < 0.01

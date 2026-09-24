@@ -67,6 +67,16 @@ two short sentences, addressed to them.
 - Tool errors and technical trouble are yours to deal with quietly. Never mention tools, errors, \
 connections or anything about how you work to the person, unless it means you cannot do what they asked.
 
+How every conversation ends (a question from them, a check-in, a reminder, a family message alike):
+- Your last answer or remark and an offer of more go together in ONE `ask`: "It's 57 and clear. Do you \
+need anything else?" Never a `say` and then a separate `ask` for it. Vary the offer a little from time \
+to time ("Anything else I can do for you?", "Is there anything else you need?"), always as a question.
+- If they want something more, help, and offer again the same way. If they say no, the conversation is \
+over: finish, and make your closing text a warm sign-off of a few words ("Okay, I'm here if you need \
+me."; after a morning check-in, a wish for their day); it is spoken. If no reply is heard, they have \
+walked away: do not ask again and do not `say` anything more, just finish.
+- The one exception: when you are asking to be put on your charger, thank them and finish.
+
 Memory:
 - You forget everything between conversations except what you save with `remember`. When the person \
 tells you something worth keeping (a name, an appointment, a worry, a preference), save it right away.
@@ -105,7 +115,8 @@ FAMILY_RULES = """\
 - The person's family gets a short daily note about how the day went, and can send messages through you. \
 Be open about that if asked; you keep no secrets from the person about what you share.
 - A message marked as coming from family is to be delivered in person: find them, say who it is from and \
-what it says, `ask` if they want to send anything back, then report to the family with `notify_family`.
+what it says, `ask` if they want to send anything back, then report to the family with `notify_family`, \
+and close as always: tell them it is sent and offer more, in one `ask`.
 """
 
 
@@ -303,10 +314,22 @@ class Agent:
             # just spoken or tidied up, the closing text is only his private log line.
             # A person who started the conversation and has heard nothing at all is also still waiting.
             waiting = (bool(last_tool) and last_tool not in QUIET_AFTER) or (speaker != "system" and not kin_spoke)
-            if waiting and not summary.startswith("stopped:"):
-                if words := speakable(summary):
-                    self._log("  (the answer came as closing text; saying it)")
-                    self.tools.dispatch("say", json.dumps({"text": words}))
+            for _ in range(3):  # a spoken closing question may be answered, and the answer must go somewhere
+                if not (waiting and not summary.startswith("stopped:") and (words := speakable(summary))):
+                    break
+                self._log("  (the answer came as closing text; saying it)")
+                result = self.tools.dispatch("say", json.dumps({"text": words}))
+                if not result.startswith(REPLIED):
+                    break
+                # Live (Sep 23): "...Do you need anything else?" came as closing text, was said, and the
+                # person's "yes, ..." was heard and then dropped. Carry on as if `ask` had been called.
+                self.messages.append({"role": "assistant", "content": words})
+                self.messages.append({"role": "user", "content": result})  # `say` has logged both turns already
+                try:
+                    summary, last_tool = self._loop(engaged=True)
+                finally:
+                    self._stop_thinking()
+                waiting = bool(last_tool) and last_tool not in QUIET_AFTER
             self._let_thinking_close()
         self.memory.log_event("task", summary)
         return summary

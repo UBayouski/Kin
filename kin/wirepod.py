@@ -172,6 +172,7 @@ _STAMP = re.compile(r"\d{4}\.\d\d\.\d\d \d\d:\d\d:\d\d")
 _STAMP_FORMAT = "%Y.%m.%d %H:%M:%S"
 _HEARD = re.compile(r"Bot \w+ Transcribed text: (.*)$")
 _SENT = re.compile(r"Bot \w+ Intent Sent: (\S+)")
+_WAKE = re.compile(r"Bot \w+ Stream type: ")  # written the moment he starts listening after the wake word
 
 
 def interactions(lines: list[str]) -> list[tuple[str, str]]:
@@ -194,11 +195,12 @@ def interactions(lines: list[str]) -> list[tuple[str, str]]:
 class IntentWatcher:
     """Polls wire-pod's log and records the person's dealings with Vector himself."""
 
-    def __init__(self, poll_seconds: float = 5.0, start: bool = True):
+    def __init__(self, poll_seconds: float = 1.0, start: bool = True):
         self._poll_seconds = poll_seconds
         self._mark = ""                 # timestamp of the newest line dealt with ("2026.09.20 11:02:03")
         self._at_mark: set[str] = set()  # the lines seen at exactly that second
         self._primed = False
+        self.last_wake = float("-inf")  # monotonic time Vector last heard his wake word (see `spoken_to`)
         if start:
             threading.Thread(target=self._watch, daemon=True, name="wire-pod watcher").start()
 
@@ -217,7 +219,16 @@ class IntentWatcher:
         if not self._primed:  # everything already in the log when Kin starts is history, not news
             self._primed = True
             return []
+        if any(_WAKE.search(line) for line in new):
+            self.last_wake = time.monotonic()
         return new
+
+    def spoken_to(self, within_seconds: float = 60.0) -> bool:
+        """Has Vector heard his wake word in the last little while? wire-pod logs the start of listening
+        two or three seconds before it sends the intent, which is time enough to get out of his way: the
+        idle hold blocked his own reactions ("I love you" got nothing, Sep 23), so the service drops it
+        for a minute whenever he is spoken to."""
+        return time.monotonic() - self.last_wake <= within_seconds
 
     def _new_lines(self) -> list[str]:
         text = httpx.get(f"{config.wirepod_url()}/api/get_debug_logs", timeout=10).text

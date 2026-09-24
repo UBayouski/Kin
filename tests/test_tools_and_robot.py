@@ -235,7 +235,7 @@ def test_between_tasks_kin_keeps_a_light_hold_so_vector_does_not_wander(monkeypa
     robot = SimpleNamespace(conn=Conn())
     monkeypatch.setattr(kin_robot.time, "sleep", lambda s: None)
 
-    kin_robot.hold_idle(robot)
+    assert kin_robot.hold_idle(robot) is True and kin_robot.idle_held(robot)
     with kin_robot.control(robot):
         levels.append("task")
     assert levels == [ControlPriorityLevel.RESERVE_CONTROL, "released", ControlPriorityLevel.DEFAULT_PRIORITY, "task",
@@ -269,3 +269,58 @@ def test_a_looped_animation_is_closed_with_its_get_out():
     with kin_robot.animating(robot, "KnowledgeGraphAnswer"):
         pass
     assert played == ["KnowledgeGraphAnswer", "cancel", "KnowledgeGraphGetOut"]
+
+
+def test_a_pinned_placeholder_voltage_or_a_disagreeing_charger_state_is_not_a_reading():
+    """Sep 22 evening: 3.60 V "ok", unchanging, "off the charger" while the robot's status said on it:
+    the rescue ran and the family got a stranded alert for a robot sitting on his dock."""
+    from types import SimpleNamespace
+
+    from kin.robot import gauge_read
+
+    report = lambda volts, on=False: SimpleNamespace(battery_volts=volts, is_on_charger_platform=on)
+    assert not gauge_read(report(3.60), previous_volts=3.60, status_on_charger=False), "pinned placeholder"
+    assert not gauge_read(report(0.00), previous_volts=4.0, status_on_charger=False), "not read yet after a boot"
+    assert not gauge_read(report(3.85), previous_volts=3.84, status_on_charger=True), "the two sources disagree"
+    assert gauge_read(report(3.60), previous_volts=3.63, status_on_charger=False), "a real battery passing 3.60"
+    assert gauge_read(report(3.52, on=True), previous_volts=3.55, status_on_charger=True)
+    assert gauge_read(report(3.52), previous_volts=3.55, status_on_charger=None), "no status to compare with"
+
+
+def test_a_closing_offer_listens_for_less_time_than_a_real_question(memory):
+    """Every conversation ends with an offer of more, and silence is its usual answer; 12 s of listening
+    pose after each one was too long."""
+    from types import SimpleNamespace
+
+    from kin.tools import CLOSING_LISTEN_SECONDS, LISTEN_SECONDS, RobotTools, is_closing_offer
+
+    assert is_closing_offer("It's 57 and clear. Do you need anything else?")
+    assert is_closing_offer("Lovely, well done. Anything else I can do for you?")
+    assert not is_closing_offer("How did you sleep?")
+
+    waits = []
+    ears = SimpleNamespace(listen=lambda timeout=12.0: waits.append(timeout) or None)
+    kit = RobotTools(SimpleNamespace(anim=SimpleNamespace(play_animation_trigger=lambda *a, **k: None)),
+                     memory, mouth=SimpleNamespace(say=lambda text: None), ears=ears)
+    kit.dispatch("ask", '{"question": "How did you sleep?"}')
+    kit.dispatch("ask", '{"question": "Is there anything else you need?"}')
+    assert waits == [LISTEN_SECONDS, CLOSING_LISTEN_SECONDS]
+
+
+def test_a_reminder_outcome_lands_on_the_reminder_being_handled_whatever_id_the_planner_wrote(memory):
+    """Sep 23, 18:00: the planner logged 'no_response' on a made-up #5 for reminder #1, so #1 stayed
+    unsettled and was asked again ten minutes later."""
+    import pytest
+
+    kit = RobotTools(None, memory)
+    reminder_id = memory.add_reminder("drink water", "18:00")
+
+    with pytest.raises(ValueError, match="no reminder #5"):
+        memory.log_reminder(5, "no_response")
+
+    kit.current_reminder = reminder_id
+    assert kit.dispatch("reminder_outcome", json.dumps({"reminder_id": 5, "outcome": "confirmed"})) == "logged"
+    assert [row[0] for row in memory.db.execute("SELECT reminder_id FROM reminder_log")] == [reminder_id]
+
+    kit.current_reminder = None
+    assert kit.dispatch("reminder_outcome", json.dumps({"reminder_id": 5, "outcome": "confirmed"})).startswith("error:")

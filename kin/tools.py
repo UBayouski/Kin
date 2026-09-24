@@ -121,7 +121,8 @@ TOOL_SPECS = [
     _spec(
         "weather",
         "Current weather plus today's and tomorrow's forecast, from a forecast service. Always use this for "
-        "weather, never `web_search` and never your own knowledge. Say the temperature with its unit.",
+        "weather, never `web_search` and never your own knowledge. Say the temperature with its unit. Tell the "
+        "person about now and today in one or two short sentences; tomorrow only if they asked about it.",
         {"place": {"type": "string", "description": "Town or city; leave empty for where the person lives"}},
     ),
     _spec(
@@ -153,8 +154,9 @@ TOOL_SPECS = [
 WEB_SEARCH_SPEC = _spec(
     "web_search",
     "Search the live web for current facts: news, TV listings, opening hours, sports results, or whether "
-    "a message or phone call matches a known scam. Never answer such questions from memory. Include the person's "
-    "town in the query when the answer depends on where they live. Not for weather: use `weather`. Be wary of "
+    "a message or phone call matches a known scam. Never answer such questions from memory. When the answer "
+    "depends on where they live, put the town AND its state or country in the query, exactly as given to you: "
+    "'San Jose' alone once returned news from Costa Rica. Not for weather: use `weather`. Be wary of "
     "numbers and units in results; if a figure looks implausible, say you are not sure rather than repeat it.",
     {
         "query": {"type": "string"},
@@ -200,6 +202,16 @@ _SPOKEN_UNITS = [
 ]
 
 
+LISTEN_SECONDS = 12.0
+CLOSING_LISTEN_SECONDS = 8.0
+_CLOSING = re.compile(r"anything (else|more)|else (i can|you need|can i)", re.IGNORECASE)
+
+
+def is_closing_offer(question: str) -> bool:
+    """Does this question end a conversation with an offer of more? Silence is the usual answer to it."""
+    return bool(_CLOSING.search(question))
+
+
 def is_echo(question: str, reply: str) -> bool:
     """Did the microphone only catch the tail of Kin's own question? Live, "Could you please place me on my
     charger?" got the reply "charger." from the room's echo, and Kin thanked a person who was not there.
@@ -223,6 +235,7 @@ class RobotTools:
         # Returns True once when the person pets Vector. Slow moves poll it and stop, so a two-minute
         # docking attempt no longer makes him deaf to the person standing next to him.
         self.attention = attention
+        self.current_reminder: int | None = None  # set by the service for the length of a reminder task
         self.memory = memory
         self.family = family_link
         self.mouth = mouth or VectorMouth(robot)
@@ -267,8 +280,10 @@ class RobotTools:
         if prepare := getattr(self.ears, "prepare", None):
             prepare()  # microphone open before he speaks, so a prompt answer is not clipped; `listen` closes it
         self._speak(question)
+        # A closing offer ("anything else?") that meets silence should not keep him listening for long.
+        seconds = CLOSING_LISTEN_SECONDS if is_closing_offer(question) else LISTEN_SECONDS
         with kin_robot.animating(self.robot, "VC_ListeningLoop"):  # his own "I'm listening" look
-            reply = self.ears.listen()
+            reply = self.ears.listen(timeout=seconds)
         if not reply or is_echo(question, reply):
             return NO_REPLY
         self.memory.log_turn("person", reply)
@@ -285,6 +300,12 @@ class RobotTools:
         return "cancelled" if self.memory.deactivate_reminder(int(reminder_id)) else f"error: no reminder #{reminder_id}"
 
     def _tool_reminder_outcome(self, reminder_id: int, outcome: str) -> str:
+        # The planner once logged the outcome on a made-up id (#5 for reminder #1, Sep 23), so the reminder
+        # went unsettled and was asked again ten minutes later. During a reminder task the service says
+        # which one is being handled, and that wins over whatever id the planner wrote.
+        current = self.current_reminder
+        if current is not None and int(reminder_id) != current:
+            reminder_id = current
         self.memory.log_reminder(int(reminder_id), outcome)
         if alerts.report_missed_reminders(self.memory, self.family):
             return "logged; that was the last try for today, and the family has been told"

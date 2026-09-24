@@ -99,13 +99,14 @@ def report_body_back(memory: Memory, family: Family | None) -> str | None:
     return note
 
 
-def report_stranded(memory: Memory, family: Family | None, minutes: float) -> str | None:
-    """Tell the family, once a day, that the robot is off his charger with a low battery and nobody has
-    put him back. Left alone he runs flat and goes dark, which has happened."""
+def report_stranded(memory: Memory, family: Family | None, minutes: float,
+                    reason: str = "with a low battery") -> str | None:
+    """Tell the family, once a day, that the robot is off his charger with a low battery (or one Kin cannot
+    read) and nobody has put him back. Left alone he runs flat and goes dark, which has happened."""
     today = datetime.now().date()
     if any(kind == "stranded" for _, kind, _ in memory.events_on(today)):
         return None
-    alert = (f"The robot has been off his charger with a low battery for {minutes:.0f} minutes and needs "
+    alert = (f"The robot has been off his charger {reason} for {minutes:.0f} minutes and needs "
              "putting back on it. If he runs flat, reminders and check-ins stop.")
     memory.log_event("stranded", alert)
     memory.log_event("alert", alert)

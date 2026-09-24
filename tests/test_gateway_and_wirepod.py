@@ -120,6 +120,7 @@ def test_a_pet_is_just_a_pet_unless_pet_to_talk_is_on(memory, monkeypatch):
 
     kin = service.Service.__new__(service.Service)
     kin.memory, kin.family, kin._touch, kin._warmed_for = memory, None, Touch(), None
+    kin._gauge_stale_since, kin._last_gauge_plea = None, float("-inf")
     for quiet in ("_heartbeat", "_rescue_battery", "_presence", "_checkin_due", "_acknowledge_touch"):
         monkeypatch.setattr(kin, quiet, lambda *a, **k: False, raising=False)
     monkeypatch.setattr(memory, "reminders_due", lambda *a, **k: [])
@@ -133,7 +134,9 @@ def test_a_pet_is_just_a_pet_unless_pet_to_talk_is_on(memory, monkeypatch):
     monkeypatch.setenv("KIN_PET_TO_TALK", "on")
     kin._touch = Touch()
     assert kin.tick(None, agent) is True
-    assert "Anything else?" in prompts[0] and "go_home" not in prompts[0]
+    assert "go_home" not in prompts[0]
+    from kin.agent import Agent
+    assert "need anything else" in Agent._system_prompt(), "the closing offer is a rule for every conversation"
 
 
 def test_going_home_is_only_asked_for_when_kin_may_have_left_the_charger(monkeypatch):
@@ -210,3 +213,173 @@ def test_what_the_person_says_to_vector_himself_reaches_kins_context(memory):
 
     assert 'told Vector they love him: "i love you"' in context
     assert datetime.now().strftime("%H:%M")[:2] in context
+
+
+def test_a_battery_gauge_not_yet_read_is_not_a_low_battery(memory, family, monkeypatch):
+    """Right after a boot he reports 0.00 V while "full" (Sep 22, 13:08); it set off the low-battery rescue
+    and he asked to be put on a charger he was already near. A gauge under 1 V has simply not been read."""
+    from types import SimpleNamespace
+
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    kin.memory, kin.family = memory, family
+    kin._low_readings, kin._running_flat, kin._body_lost_since, kin._off_dock_since = 0, False, None, None
+    kin._gauge_trusted, kin._last_moving, kin._intents, kin._gauge_stale_since = True, float("-inf"), None, None
+    monkeypatch.setenv("KIN_IDLE_HOLD", "off")
+    kin._next_heartbeat, kin._battery, kin._volts = 0.0, None, 0.0
+    battery = SimpleNamespace(battery_level=3, battery_volts=0.0, is_on_charger_platform=False)
+    robot = SimpleNamespace(get_battery_state=lambda: battery, touch=SimpleNamespace(last_sensor_reading=None))
+    monkeypatch.setattr(service.kin_robot, "call", lambda method, *a, **k: method())
+    monkeypatch.setattr(service.kin_robot, "touch_samples", lambda robot: [5470, 5473, 5469])
+
+    for _ in range(3):
+        kin._next_heartbeat = 0.0
+        kin._heartbeat(robot)
+    assert kin._running_flat is False
+
+    battery.battery_volts = 3.50  # a real reading that low, off the charger, still counts
+    for _ in range(2):
+        kin._next_heartbeat = 0.0
+        kin._heartbeat(robot)
+    assert kin._running_flat is True
+
+
+def test_off_the_charger_with_nothing_to_do_he_drives_back_by_himself(memory, monkeypatch):
+    """He gets off the dock in the gaps when the link is down (Sep 22, 13:49) and cannot be trusted to find
+    it once the battery is low; docking from the table works in daylight, so it is tried early."""
+    from types import SimpleNamespace
+
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    kin.memory = memory
+    kin._off_dock_since, kin._running_flat, kin._last_return_home = None, False, float("-inf")
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(service.kin_robot, "control", lambda robot: __import__("contextlib").nullcontext())
+    results = ["cannot see the charger from here.", "on the charger"]
+    agent = SimpleNamespace(tools=SimpleNamespace(dispatch=lambda name, args: results.pop(0)))
+
+    assert kin._return_home(None, agent) is False, "on the charger: nothing to do"
+    kin._off_dock_since = clock["now"]
+    assert kin._return_home(None, agent) is False, "just got off: a grace period, someone may be holding him"
+    clock["now"] += service.OFF_DOCK_GRACE_SECONDS + 1
+    assert kin._return_home(None, agent) is True
+    clock["now"] += 60
+    assert kin._return_home(None, agent) is False, "a failed try is not repeated straight away"
+    clock["now"] += service.RETURN_HOME_EVERY_SECONDS
+    assert kin._return_home(None, agent) is True
+    assert any("drove back onto the charger" in d for _, k, d in memory.events_on(__import__("datetime").date.today()))
+
+    kin._running_flat = True
+    clock["now"] += service.RETURN_HOME_EVERY_SECONDS
+    assert kin._return_home(None, agent) is False, "a low battery is the rescue's job, with the person told"
+
+
+def test_a_silent_body_is_believed_only_after_a_look_over_a_fresh_connection(memory, family, monkeypatch):
+    """Sep 23, 06:29: the service's own event stream had died quietly, its touch readings froze, and the
+    family was told the robot needed restarting while he slept soundly on his dock."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    kin.memory, kin.family = memory, family
+    kin._low_readings, kin._running_flat, kin._body_lost_since, kin._off_dock_since = 0, False, None, None
+    kin._gauge_trusted, kin._body_rechecked, kin._last_moving, kin._intents = True, False, float("-inf"), None
+    kin._gauge_stale_since = None
+    kin._next_heartbeat, kin._battery, kin._volts = 0.0, None, 0.0
+    monkeypatch.setenv("KIN_IDLE_HOLD", "off")
+    battery = SimpleNamespace(battery_level=3, battery_volts=3.60, is_on_charger_platform=True)
+    robot = SimpleNamespace(get_battery_state=lambda: battery, status=SimpleNamespace(is_on_charger=True))
+    monkeypatch.setattr(service.kin_robot, "call", lambda method, *a, **k: method())
+    monkeypatch.setattr(service.kin_robot, "touch_samples", lambda robot: [5491] * 20)
+
+    with pytest.raises(RuntimeError, match="fresh link"):
+        kin._heartbeat(robot)  # first sighting: reconnect and look again, no timer started
+    assert kin._body_lost_since is None
+
+    kin._next_heartbeat = 0.0
+    kin._heartbeat(robot)  # still frozen over the new connection: now the clock runs
+    assert kin._body_lost_since is not None
+
+    monkeypatch.setattr(service.kin_robot, "touch_samples", lambda robot: [5455, 5458, 5463])
+    kin._next_heartbeat = 0.0
+    kin._heartbeat(robot)
+    assert kin._body_lost_since is None and kin._body_rechecked is False, "alive again, and the next episode is re-checked too"
+
+
+def test_hearing_the_wake_word_drops_the_idle_hold_for_a_minute(memory, monkeypatch):
+    """The hold blocked his own reactions: "I love you" got nothing (Sep 23). wire-pod logs the start of
+    listening before it sends the intent, and that line is the cue to get out of his way."""
+    from types import SimpleNamespace
+
+    from kin import service
+
+    watcher = wirepod.IntentWatcher(start=False)
+    watcher.fresh(LOG[:3])  # history
+    assert not watcher.spoken_to()
+    watcher.fresh(LOG[:3] + ["2026.09.23 09:10:00: Bot 0dd19176 Stream type: OPUS"])
+    assert watcher.spoken_to()
+
+    kin = service.Service.__new__(service.Service)
+    kin._intents = watcher
+    dropped = []
+    monkeypatch.setattr(service.kin_robot, "idle_held", lambda robot: True)
+    monkeypatch.setattr(service.kin_robot, "drop_hold", lambda robot: dropped.append(robot))
+    kin._let_him_react("robot")
+    assert dropped == ["robot"]
+
+    monkeypatch.setattr(service.time, "monotonic", lambda: watcher.last_wake + 61)
+    assert not watcher.spoken_to(), "a minute later the heartbeat may take the hold back"
+
+
+def test_the_hold_waits_until_he_has_been_still_for_a_while(monkeypatch):
+    """A fetch-the-cube stalled mid-carry when the hold came back (Sep 23)."""
+    from types import SimpleNamespace
+
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    kin._last_moving = float("-inf")
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock["now"])
+
+    kin._watch_movement(SimpleNamespace(status=SimpleNamespace(are_motors_moving=False, is_carrying_block=True)))
+    assert not kin._still_for(20)
+    clock["now"] += 19
+    assert not kin._still_for(20)
+    clock["now"] += 2
+    assert kin._still_for(20)
+
+
+def test_an_unreadable_battery_off_the_charger_gets_a_plea_and_then_the_family(memory, family, monkeypatch):
+    """Sep 23: the gauge read 0.00 V for 40 minutes off the dock and he went dark with nobody warned."""
+    from types import SimpleNamespace
+
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    kin.memory, kin.family = memory, family
+    kin._gauge_stale_since, kin._last_gauge_plea = 1000.0, float("-inf")
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock["now"])
+    robot = SimpleNamespace(status=SimpleNamespace(is_on_charger=False))
+    pleas = []
+    agent = SimpleNamespace(run=lambda text, **k: pleas.append(text) or "asked")
+
+    clock["now"] += 5 * 60
+    assert kin._guard_unreadable_battery(robot, agent) is False
+    clock["now"] += 6 * 60
+    assert kin._guard_unreadable_battery(robot, agent) is True and "cannot read your own battery" in pleas[0]
+    assert kin._guard_unreadable_battery(robot, agent) is False, "asked once, not every tick"
+    clock["now"] += 10 * 60
+    kin._guard_unreadable_battery(robot, agent)
+    assert len(family.sent) == 1 and "cannot read" in family.sent[0]
+
+    robot.status.is_on_charger = True
+    clock["now"] += 3600
+    assert kin._guard_unreadable_battery(robot, agent) is False, "on the charger there is nothing to ask"

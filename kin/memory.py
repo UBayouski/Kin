@@ -342,6 +342,8 @@ class Memory:
     def log_reminder(self, reminder_id: int, outcome: str) -> None:
         if outcome not in REMINDER_OUTCOMES:
             raise ValueError(f"outcome must be one of {REMINDER_OUTCOMES}")
+        if self.db.execute("SELECT 1 FROM reminders WHERE id = ?", (reminder_id,)).fetchone() is None:
+            raise ValueError(f"no reminder #{reminder_id}")  # the planner once logged an outcome on a made-up id
         self.db.execute(
             "INSERT INTO reminder_log (reminder_id, ts, outcome) VALUES (?, ?, ?)", (reminder_id, _now(), outcome)
         )

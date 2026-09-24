@@ -22,6 +22,7 @@ from kin import config
 LISTEN_RATE = 16000
 _BLOCK_SECONDS = 0.1
 _LEAD_IN_BLOCKS = 4  # 0.4 s kept from just before the voice crossed the threshold
+_FLOOR_CAP = 0.006   # the room's background level is never taken to be more than this (speech is 0.03 to 0.1 here)
 
 
 class Mouth(Protocol):
@@ -134,6 +135,22 @@ class HubEars:
             )
             self._stream.start()
 
+    def _skip_speaker_tail(self, quiet_level: float = 0.02, quiet_blocks: int = 3, max_seconds: float = 1.0) -> float:
+        """Let the end of Kin's own words pass before listening for the person's.
+
+        The speaker finishes a little after `say` returns (the output device's latency, then the room),
+        and that tail was landing in every capture: the transcripts began with Kin's last words ("Are you
+        there? Yes.") and the "voice" was heard from the first block. Returns the seconds skipped."""
+        skipped, quiet = 0.0, 0
+        while skipped < max_seconds - 1e-6 and quiet < quiet_blocks:
+            try:
+                block = self._blocks.get(timeout=1)
+            except queue.Empty:
+                break
+            skipped += len(block) / LISTEN_RATE
+            quiet = quiet + 1 if float(np.sqrt(np.mean(block**2))) < quiet_level else 0
+        return skipped
+
     def _release(self) -> None:
         if self._stream is not None:
             try:
@@ -149,14 +166,18 @@ class HubEars:
         end_pause = config.end_pause()
         lead_in: deque[np.ndarray] = deque(maxlen=_LEAD_IN_BLOCKS)
         heard: list[np.ndarray] = []
-        now = 0.0
+        now = peak = 0.0
         speech_started = last_voice = None
         for block in blocks:
             now += len(block) / LISTEN_RATE
             level = float(np.sqrt(np.mean(block**2)))
+            peak = max(peak, level)
             if self._noise_floor is None:
-                self._noise_floor = level
-            threshold = max(0.008, self._noise_floor * 3.0)
+                self._noise_floor = min(level, _FLOOR_CAP)
+            # Capped: a floor poisoned by an earlier noise put the threshold above the person's voice, and
+            # a floor that sits above the voice then adapts towards it and never fires (Sep 23: a reply at
+            # 0.076 went unheard against a printed threshold of 0.008, which had been far higher as she spoke).
+            threshold = max(0.008, min(self._noise_floor, _FLOOR_CAP) * 3.0)
 
             if level > threshold:
                 last_voice = now
@@ -165,14 +186,21 @@ class HubEars:
                     heard.extend(lead_in)  # the soft start of a word ("I sl...") sits under the threshold
             elif speech_started is None:
                 # Track the room's background level only while nobody is talking.
-                self._noise_floor = 0.95 * self._noise_floor + 0.05 * level
+                self._noise_floor = min(_FLOOR_CAP, 0.95 * self._noise_floor + 0.05 * level)
                 lead_in.append(block)
 
             if speech_started is not None:
                 heard.append(block)
                 if now - last_voice > end_pause or now - speech_started > max_seconds:
+                    # Live, a two-word reply took 12 s to come back: something kept the level up. These
+                    # numbers say what: how long the "voice" lasted and against what threshold.
+                    print(f"  (capture: voice from {speech_started:.1f}s for {last_voice - speech_started:.1f}s, "
+                          f"threshold {threshold:.4f}, room {self._noise_floor:.4f}, loudest {peak:.4f})", flush=True)
                     break
             elif now > timeout:
+                # Live, a "no, thank you" went unheard with nothing in the log to say why; these numbers do.
+                print(f"  (heard nothing for {timeout:.0f}s: loudest {peak:.4f} against a threshold of "
+                      f"{threshold:.4f}, room {self._noise_floor:.4f})", flush=True)
                 return None
         return np.concatenate(heard) if heard else None
 
@@ -200,6 +228,8 @@ class HubEars:
         if self._blocks is not None:  # opened by `prepare`: what it has so far is Kin's own question
             while not self._blocks.empty():
                 self._blocks.get_nowait()
+            self._skip_speaker_tail()
+        self._noise_floor = None  # measured afresh each time; what the room was like an hour ago is no guide
         try:
             deadline = time.monotonic() + timeout
             while (remaining := deadline - time.monotonic()) > 0.5:
