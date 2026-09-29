@@ -78,16 +78,21 @@ def render_turns(turns) -> str:
 def propose(today: str, facts_text: str, conversation_text: str) -> list[dict]:
     """The thinking half: needs only text and Nebius credentials, so it can run anywhere (the nightly job)."""
     prompt = PROMPT.format(today=today, facts=facts_text or "(none)", conversation=conversation_text or "(none)")
-    response = llm.client().chat.completions.create(
-        model=config.nightly_model(),
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=8000,  # a reasoning model thinks first; at 4000 it ran out before the JSON two nights running
-        temperature=0.2,
-    )
-    choice = response.choices[0]
-    if choice.finish_reason == "length":
-        raise ValueError("model ran out of tokens before finishing its answer")
-    return _parse(choice.message.content or "")
+    # A reasoning model thinks first, and with a few days of conversation to read it thought past 8000
+    # tokens (Sep 28). Second try: thinking off. The operations are a structured job, not a judgement call.
+    for thinking in (True, False):
+        extra = {} if thinking else {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+        response = llm.client().chat.completions.create(
+            model=config.nightly_model(),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=8000,
+            temperature=0.2,
+            **extra,
+        )
+        choice = response.choices[0]
+        if choice.finish_reason != "length":
+            return _parse(choice.message.content or "")
+    raise ValueError("model ran out of tokens before finishing its answer, even without thinking")
 
 
 def consolidate(memory: Memory, dry_run: bool = False) -> Report:

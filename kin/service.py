@@ -63,6 +63,7 @@ GAUGE_UNREADABLE = (
     "being low; you do not know. Thank them and finish.]"
 )
 BODY_LOST_MINUTES = 5  # his body board silent this long, and the family is told
+HOLD_REFUSALS_BEFORE_RECONNECT = 10  # heartbeats (5 minutes) without the idle hold being granted: the link is bad
 OFF_DOCK_GRACE_SECONDS = 120     # off the charger this long with nothing to do, and he tries to get back
 RETURN_HOME_EVERY_SECONDS = 1800  # and again no sooner than this if it failed (each try is a slow turn)
 ACK_SECONDS = 3.5      # how long Vector needs to say "On it!" himself before Kin takes over
@@ -85,7 +86,8 @@ def reminder_prompt(reminder: Reminder, attempt: int) -> str:
     again = " This is another try; they did not answer earlier, so be gentle." if attempt > 1 else ""
     return (
         f"[Reminder #{reminder.id} is due: '{reminder.text}' (set for {reminder.time_of_day}).{again} "
-        "Find the person, then `ask` them about it in a warm, natural way. Record the result with "
+        "Find the person, then `ask` them about it in a warm, natural way, ONCE: if no reply is heard, do not "
+        "ask again now (you will be asked to try again later). Record the result with "
         "`reminder_outcome`: confirmed, declined, or no_response if you cannot find them or get no answer. "
         "If they answered, a few warm words back and the offer of more go in one `ask`, as always (\"Lovely, "
         "well done. Do you need anything else?\" / \"All right, another time. Anything else I can do?\"): "
@@ -116,6 +118,9 @@ class Service:
         self._next_heartbeat = 0.0
         self._battery: tuple[str, bool] | None = None
         self._volts = 0.0
+        self._raw_volts = -1.0  # the previous reading, whatever it was
+        self._hold_refusals = 0
+        self._report_on_charger = True  # what the battery report last said; the status stream can go stale
         self._warmed_for: int | str | None = None  # the heard request (or "checkin") the planner was last warmed up for
         self._body_lost_since: float | None = None
         self._off_dock_since: float | None = None
@@ -273,7 +278,9 @@ class Service:
             self._body_rechecked = False
         body_lost = self._watch_body(silent)
         # With his body silent the battery figures are stale, so they say nothing about running flat.
-        gauge_read = kin_robot.gauge_read(battery, self._volts, getattr(getattr(robot, "status", None), "is_on_charger", None))
+        gauge_read = kin_robot.gauge_read(battery, self._raw_volts, getattr(getattr(robot, "status", None), "is_on_charger", None))
+        self._raw_volts = battery.battery_volts  # every reading, not only the logged steps: a frozen gauge shows here
+        self._report_on_charger = bool(battery.is_on_charger_platform)
         if not gauge_read and self._gauge_trusted:
             log(f"battery telemetry stale ({battery.battery_volts:.2f} V pinned, or the charger state disagrees "
                 "with the robot's status); not acting on it")
@@ -293,7 +300,18 @@ class Service:
         # A dropped link releases the idle hold, and a request made while the link is still shaky can go
         # unanswered; live, he wandered off the dock in that gap. So the hold is checked every heartbeat.
         if config.idle_hold() and not kin_robot.idle_held(robot) and not self._spoken_to() and self._still_for(20):
-            log("holding him again" if kin_robot.hold_idle(robot) else "could not take the idle hold; will retry")
+            if kin_robot.hold_idle(robot):
+                log("holding him again")
+                self._hold_refusals = 0
+            else:
+                self._hold_refusals += 1
+                if self._hold_refusals == 1:
+                    log("could not take the idle hold; will retry")
+                if self._hold_refusals >= HOLD_REFUSALS_BEFORE_RECONNECT:
+                    # Sep 24: refused every 30 s for 100 minutes on a half-dead link that still answered
+                    # battery reads, so nothing reconnected, and he wandered off the dock in the meantime.
+                    self._hold_refusals = 0
+                    raise RuntimeError("the idle hold has been refused for 5 minutes; reconnecting")
         # Log on any change of level or charger state, and on each 0.05 V step, so the run-up to a reboot is visible.
         if state != self._battery or abs(battery.battery_volts - self._volts) >= 0.05:
             self._battery, self._volts = state, battery.battery_volts
@@ -404,7 +422,10 @@ class Service:
         """Off the charger with a gauge that has not given a real reading for a while: ask to be put on it,
         and tell the family later. Sep 23: the gauge read 0.00 V from a restart at 08:56 until he went dark
         at 09:44, 40 minutes off the dock, and ignoring the unreadable gauge meant nobody was warned."""
-        if self._gauge_stale_since is None or getattr(getattr(robot, "status", None), "is_on_charger", True):
+        # Only when BOTH sources say he is off the charger. Sep 24: the status stream said "off" for six
+        # hours while the battery report said "on" (and he charged to full), and he asked every hour.
+        status_on = getattr(getattr(robot, "status", None), "is_on_charger", True)
+        if self._gauge_stale_since is None or status_on or self._report_on_charger:
             return False
         minutes = (time.monotonic() - self._gauge_stale_since) / 60
         if minutes >= GAUGE_UNREADABLE_MINUTES and time.monotonic() - self._last_gauge_plea > 3600:
@@ -450,6 +471,9 @@ class Service:
 
         if self._touch.petted():
             talk = config.pet_to_talk()
+            if self._touch.resting_on_something():
+                log("his back has been pressed against something for a while; not a pet")
+                return False
             log("petted -> conversation" if talk else "petted")
             # A pet is proof the person is here; say so at once rather than after the conversation.
             self.memory.log_event("presence", "petted")
@@ -481,7 +505,7 @@ class Service:
             renudge_minutes=config.renudge_minutes(), max_attempts=config.reminder_attempts()
         ):
             attempt = 1 + sum(
-                1 for ts, text, outcome in self.memory.reminder_history(datetime.now().date())
+                1 for _, text, outcome in self.memory.reminder_history(datetime.now().date())
                 if text == reminder.text and outcome == "no_response"
             )
             log(f"reminder #{reminder.id} '{reminder.text}' (attempt {attempt})")

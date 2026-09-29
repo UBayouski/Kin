@@ -139,33 +139,58 @@ class TouchWatcher:
     The firmware's `is_being_touched` flag flickers on and off even during a steady stroke, so one
     sample means little. This samples it 20 times a second on a background thread and reports a pet
     when enough of the last 1.5 seconds was 'touched'.
+
+    A hand always comes off again, so a second pet is only reported after the sensor has been released.
+    Without that rule, anything resting against his back reports a pet every cooldown for as long as it
+    is there: in his new enclosure that was one every 20 s for an hour (Sep 28), which filled memory with
+    presence, made the house look permanently occupied, and interrupted what he was doing.
     """
 
     SAMPLE_SECONDS = 0.05
     WINDOW_SAMPLES = 30      # 1.5 s
     TOUCHED_SAMPLES = 8      # at least 0.4 s of it touched
+    RELEASED_SAMPLES = 10    # 0.5 s untouched before another pet can be reported
     COOLDOWN_SECONDS = 20
 
     def __init__(self, robot: anki_vector.Robot):
         self._robot = robot
         self._pet = threading.Event()
         self._stop = threading.Event()
+        self._resting_since: float | None = None  # when the sensor last started reading touched without a break
+        self._window: deque[bool] = deque(maxlen=self.WINDOW_SAMPLES)
+        self._released = True
+        self._quiet_until = 0.0
         threading.Thread(target=self._watch, daemon=True, name="Touch watcher").start()
 
+    def resting_on_something(self, seconds: float = 120.0) -> bool:
+        """Has his back been touched without a break for this long? Then it is furniture, not a person."""
+        return self._resting_since is not None and time.monotonic() - self._resting_since >= seconds
+
+    def step(self, touched: bool, now: float) -> bool:
+        """One sample. Returns whether this one completes a pet. Pure, so the rules can be tested."""
+        self._window.append(touched)
+        recent = list(self._window)[-self.RELEASED_SAMPLES:]
+        if len(recent) >= self.RELEASED_SAMPLES and not any(recent):
+            self._released = True
+            self._resting_since = None
+        elif all(self._window) and len(self._window) == self._window.maxlen and self._resting_since is None:
+            self._resting_since = now
+        if self._released and now >= self._quiet_until and sum(self._window) >= self.TOUCHED_SAMPLES:
+            self._released = False
+            self._window.clear()
+            self._quiet_until = now + self.COOLDOWN_SECONDS
+            return True
+        return False
+
     def _watch(self) -> None:
-        window: deque[bool] = deque(maxlen=self.WINDOW_SAMPLES)
-        quiet_until = 0.0
         while not self._stop.is_set():
             try:
                 reading = self._robot.touch.last_sensor_reading
-                window.append(bool(reading and reading.is_being_touched))
+                touched = bool(reading and reading.is_being_touched)
             except Exception:
-                window.append(False)
-            now = time.monotonic()
-            if now >= quiet_until and sum(window) >= self.TOUCHED_SAMPLES:
+                touched = False
+            if self.step(touched, time.monotonic()):
                 self._pet.set()
-                window.clear()
-                quiet_until = now + self.COOLDOWN_SECONDS
             time.sleep(self.SAMPLE_SECONDS)
 
     def petted(self) -> bool:
@@ -236,6 +261,10 @@ def gauge_read(battery, previous_volts: float, status_on_charger: bool | None) -
     if volts < 1.0:
         return False
     if abs(volts - 3.605) <= 0.01 and abs(volts - previous_volts) < 0.005:
+        return False
+    # Sep 24: pinned at exactly 3.635 V, "full", not charging, on the dock: a placeholder that had drifted
+    # outside the band above. A real gauge moves by millivolts; "full" below 3.7 V is never real.
+    if battery.battery_level == 3 and volts < 3.7 and abs(volts - previous_volts) < 0.0005:
         return False
     if status_on_charger is not None and bool(status_on_charger) != bool(battery.is_on_charger_platform):
         return False

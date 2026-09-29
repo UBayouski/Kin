@@ -278,13 +278,15 @@ def test_a_pinned_placeholder_voltage_or_a_disagreeing_charger_state_is_not_a_re
 
     from kin.robot import gauge_read
 
-    report = lambda volts, on=False: SimpleNamespace(battery_volts=volts, is_on_charger_platform=on)
+    report = lambda volts, on=False, level=2: SimpleNamespace(battery_volts=volts, is_on_charger_platform=on, battery_level=level)
     assert not gauge_read(report(3.60), previous_volts=3.60, status_on_charger=False), "pinned placeholder"
     assert not gauge_read(report(0.00), previous_volts=4.0, status_on_charger=False), "not read yet after a boot"
     assert not gauge_read(report(3.85), previous_volts=3.84, status_on_charger=True), "the two sources disagree"
     assert gauge_read(report(3.60), previous_volts=3.63, status_on_charger=False), "a real battery passing 3.60"
     assert gauge_read(report(3.52, on=True), previous_volts=3.55, status_on_charger=True)
     assert gauge_read(report(3.52), previous_volts=3.55, status_on_charger=None), "no status to compare with"
+    assert not gauge_read(report(3.635, on=True, level=3), previous_volts=3.635, status_on_charger=True), "Sep 24: pinned 'full' below 3.7 V"
+    assert gauge_read(report(3.635, on=True, level=3), previous_volts=3.631, status_on_charger=True), "moving: a real gauge, oddly labelled"
 
 
 def test_a_closing_offer_listens_for_less_time_than_a_real_question(memory):
@@ -324,3 +326,45 @@ def test_a_reminder_outcome_lands_on_the_reminder_being_handled_whatever_id_the_
 
     kit.current_reminder = None
     assert kit.dispatch("reminder_outcome", json.dumps({"reminder_id": 5, "outcome": "confirmed"})).startswith("error:")
+
+
+def watcher():
+    """A TouchWatcher with no robot and no thread; drive it with `step`."""
+    from collections import deque
+
+    from kin.robot import TouchWatcher
+
+    w = TouchWatcher.__new__(TouchWatcher)
+    w._window, w._released, w._quiet_until, w._resting_since = deque(maxlen=TouchWatcher.WINDOW_SAMPLES), True, 0.0, None
+    return w
+
+
+def feed(w, touched, count, start=0.0, step=0.05):
+    """`count` samples of the same reading; returns the times at which a pet fired."""
+    fired = []
+    for i in range(count):
+        if w.step(touched, start + i * step):
+            fired.append(start + i * step)
+    return fired
+
+
+def test_a_stroke_is_one_pet_and_the_hand_must_come_off_before_the_next():
+    w = watcher()
+
+    assert len(feed(w, True, 20)) == 1, "one stroke, one pet"
+    assert feed(w, False, 20, start=1.0) == [], "letting go is not a pet"
+    assert len(feed(w, True, 20, start=30.0)) == 1, "a second stroke after the cooldown"
+
+
+def test_something_resting_against_his_back_is_not_a_pet_over_and_over():
+    """Sep 28, in his new enclosure: a pet every 20 s for an hour, which filled memory with presence,
+    made the house look permanently occupied and interrupted what he was doing."""
+    w = watcher()
+
+    fired = feed(w, True, 20 * 60 * 5)  # five minutes of unbroken contact, at 20 samples a second
+
+    assert len(fired) == 1, "reported once, not every cooldown"
+    assert w.resting_on_something(seconds=120), "and Kin can tell it is furniture, not a person"
+
+    feed(w, False, 20, start=999.0)
+    assert not w.resting_on_something(seconds=120), "released again"

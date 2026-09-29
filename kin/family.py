@@ -16,6 +16,7 @@ from kin import config
 from kin.memory import Memory
 
 _POLL_SECONDS = 25
+TELEGRAM_LIMIT = 4096  # characters per message; a longer one is refused outright
 
 
 def available() -> bool:
@@ -32,12 +33,21 @@ class Family:
         threading.Thread(target=self._poll_forever, daemon=True, name="Telegram poller").start()
 
     def send(self, text: str, chat_id: int | None = None) -> int:
-        """Send to one chat, or to every family chat. Returns how many were sent."""
+        """Send to one chat, or to every family chat. Returns how many were sent.
+
+        A refusal is printed: the Sep 28 digest was 7600 characters, over Telegram's limit, and the
+        failure was silent, so the family simply had no note that evening and nothing said why.
+        """
         targets = [chat_id] if chat_id else sorted(self._allowed)
+        text = text if len(text) <= TELEGRAM_LIMIT else text[:TELEGRAM_LIMIT - 20].rstrip() + "\n[...]"
         sent = 0
         for target in targets:
             response = httpx.post(f"{self._url}/sendMessage", json={"chat_id": target, "text": text}, timeout=20)
-            sent += response.is_success
+            if response.is_success:
+                sent += 1
+            else:
+                print(f"  (Telegram refused a message to {target}: {response.status_code} "
+                      f"{response.text[:120]})", flush=True)
         return sent
 
     def _poll_forever(self) -> None:

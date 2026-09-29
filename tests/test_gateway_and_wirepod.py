@@ -115,6 +115,9 @@ def test_a_pet_is_just_a_pet_unless_pet_to_talk_is_on(memory, monkeypatch):
             self.pets -= 1
             return self.pets >= 0
 
+        def resting_on_something(self):
+            return False
+
         def discard(self):
             pass
 
@@ -227,7 +230,7 @@ def test_a_battery_gauge_not_yet_read_is_not_a_low_battery(memory, family, monke
     kin._low_readings, kin._running_flat, kin._body_lost_since, kin._off_dock_since = 0, False, None, None
     kin._gauge_trusted, kin._last_moving, kin._intents, kin._gauge_stale_since = True, float("-inf"), None, None
     monkeypatch.setenv("KIN_IDLE_HOLD", "off")
-    kin._next_heartbeat, kin._battery, kin._volts = 0.0, None, 0.0
+    kin._next_heartbeat, kin._battery, kin._volts, kin._raw_volts, kin._hold_refusals = 0.0, None, 0.0, -1.0, 0
     battery = SimpleNamespace(battery_level=3, battery_volts=0.0, is_on_charger_platform=False)
     robot = SimpleNamespace(get_battery_state=lambda: battery, touch=SimpleNamespace(last_sensor_reading=None))
     monkeypatch.setattr(service.kin_robot, "call", lambda method, *a, **k: method())
@@ -238,7 +241,7 @@ def test_a_battery_gauge_not_yet_read_is_not_a_low_battery(memory, family, monke
         kin._heartbeat(robot)
     assert kin._running_flat is False
 
-    battery.battery_volts = 3.50  # a real reading that low, off the charger, still counts
+    battery.battery_volts, battery.battery_level = 3.50, 2  # a real reading that low, off the charger, still counts
     for _ in range(2):
         kin._next_heartbeat = 0.0
         kin._heartbeat(robot)
@@ -291,7 +294,7 @@ def test_a_silent_body_is_believed_only_after_a_look_over_a_fresh_connection(mem
     kin._low_readings, kin._running_flat, kin._body_lost_since, kin._off_dock_since = 0, False, None, None
     kin._gauge_trusted, kin._body_rechecked, kin._last_moving, kin._intents = True, False, float("-inf"), None
     kin._gauge_stale_since = None
-    kin._next_heartbeat, kin._battery, kin._volts = 0.0, None, 0.0
+    kin._next_heartbeat, kin._battery, kin._volts, kin._raw_volts, kin._hold_refusals = 0.0, None, 0.0, -1.0, 0
     monkeypatch.setenv("KIN_IDLE_HOLD", "off")
     battery = SimpleNamespace(battery_level=3, battery_volts=3.60, is_on_charger_platform=True)
     robot = SimpleNamespace(get_battery_state=lambda: battery, status=SimpleNamespace(is_on_charger=True))
@@ -364,7 +367,7 @@ def test_an_unreadable_battery_off_the_charger_gets_a_plea_and_then_the_family(m
 
     kin = service.Service.__new__(service.Service)
     kin.memory, kin.family = memory, family
-    kin._gauge_stale_since, kin._last_gauge_plea = 1000.0, float("-inf")
+    kin._gauge_stale_since, kin._last_gauge_plea, kin._report_on_charger = 1000.0, float("-inf"), False
     clock = {"now": 1000.0}
     monkeypatch.setattr(service.time, "monotonic", lambda: clock["now"])
     robot = SimpleNamespace(status=SimpleNamespace(is_on_charger=False))
@@ -383,3 +386,36 @@ def test_an_unreadable_battery_off_the_charger_gets_a_plea_and_then_the_family(m
     robot.status.is_on_charger = True
     clock["now"] += 3600
     assert kin._guard_unreadable_battery(robot, agent) is False, "on the charger there is nothing to ask"
+    robot.status.is_on_charger, kin._report_on_charger = False, True
+    clock["now"] += 3600
+    assert kin._guard_unreadable_battery(robot, agent) is False, "the status stream alone is not believed (Sep 24: six false pleas)"
+
+
+def test_a_hold_refused_for_five_minutes_forces_a_reconnect(memory, family, monkeypatch):
+    """Sep 24: refused every 30 s for 100 minutes on a half-dead link that still answered battery reads."""
+    from types import SimpleNamespace
+
+    import pytest
+
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    kin.memory, kin.family = memory, family
+    kin._low_readings, kin._running_flat, kin._body_lost_since, kin._off_dock_since = 0, False, None, None
+    kin._gauge_trusted, kin._body_rechecked, kin._last_moving, kin._intents = True, False, float("-inf"), None
+    kin._gauge_stale_since, kin._hold_refusals = None, 0
+    kin._next_heartbeat, kin._battery, kin._volts, kin._raw_volts = 0.0, None, 0.0, -1.0
+    battery = SimpleNamespace(battery_level=3, battery_volts=4.05, is_on_charger_platform=True)
+    robot = SimpleNamespace(get_battery_state=lambda: battery, status=SimpleNamespace(is_on_charger=True))
+    monkeypatch.setattr(service.kin_robot, "call", lambda method, *a, **k: method())
+    monkeypatch.setattr(service.kin_robot, "idle_held", lambda robot: False)
+    monkeypatch.setattr(service.kin_robot, "hold_idle", lambda robot: False)
+
+    for _ in range(service.HOLD_REFUSALS_BEFORE_RECONNECT - 1):
+        kin._next_heartbeat = 0.0
+        battery.battery_volts += 0.001
+        kin._heartbeat(robot)
+    kin._next_heartbeat = 0.0
+    battery.battery_volts += 0.001
+    with pytest.raises(RuntimeError, match="refused for 5 minutes"):
+        kin._heartbeat(robot)

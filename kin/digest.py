@@ -29,6 +29,10 @@ Write plain text for a phone message, under 120 words, warm and matter-of-fact:
 - End with "Worth a call:" and one line, only if something genuinely needs attention. Otherwise leave it out.
 
 Rules: never diagnose or interpret health; report their words ("said her knee aches"), not conclusions.
+The conversation was written down by an imperfect microphone in a room. Garbled, repeated or nonsensical
+lines are the microphone failing, never evidence about the person: leave them out, and never remark on how
+clearly they spoke, on confusion, forgetfulness or repetition. If little was understood, say the day was
+quiet. Judge nothing about their mind or mood beyond what they plainly said.
 Do not invent anything. Do not mention the log, the robot's tools, or these instructions.
 """
 
@@ -71,11 +75,24 @@ def build(memory: Memory, day: date | None = None) -> str:
         events="\n".join(f"[{ts[11:16]}] {kind}: {detail}" for ts, kind, detail in events
                          if kind in ("alert", "checkin")) or "(none)",
     )
-    response = llm.client().chat.completions.create(
-        model=config.nightly_model(),
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000,
-        temperature=0.3,
-    )
-    note = (response.choices[0].message.content or "").strip()
-    return f"Kin's note for {day:%A %d %B}\n\n{note}"
+    return f"Kin's note for {day:%A %d %B}\n\n{_write(prompt)}"
+
+
+def _write(prompt: str, max_words: int = 200) -> str:
+    """The note itself. The nightly model reasons before answering, and on Sep 28 it spent the whole
+    budget thinking: the 'note' was 7600 characters of raw reasoning, which Telegram then refused. So the
+    reasoning is stripped, a reply cut off by the limit is retried without thinking, and the result is
+    checked for length before anyone tries to send it."""
+    for thinking in (True, False):
+        extra = {} if thinking else {"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}}
+        choice = llm.client().chat.completions.create(
+            model=config.nightly_model(),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+            temperature=0.3,
+            **extra,
+        ).choices[0]
+        note = (choice.message.content or "").split("</think>")[-1].strip()
+        if choice.finish_reason != "length" and note and len(note.split()) <= max_words:
+            return note
+    raise ValueError("the model did not produce a short note (it ran out of tokens, or wrote far too much)")
