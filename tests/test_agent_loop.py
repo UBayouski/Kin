@@ -431,3 +431,13 @@ def test_the_planner_is_told_when_the_fact_list_is_complete(memory):
     context = agent._context()
     assert "There are older facts than these; `recall` finds them." in context
     assert context.count("- #") == 15, "the list itself stays at fifteen"
+
+
+@pytest.mark.parametrize("status", [
+    "Check-in complete.", "Check-in completed, she is off to the park.", "Reminder done.",
+    "Conversation over.", "Checkin finished.",
+])
+def test_a_status_line_is_never_said_to_her(status):
+    """Oct 9, on the Linux hub: "No, that is it" was followed by "Check-in complete" spoken aloud, a
+    status message where a goodbye belonged."""
+    assert speakable(status) == ""

@@ -234,7 +234,7 @@ _DECLINE_CLAUSE = (r"(?:thank you(?: very much)?|thanks|i'?m (?:good|fine|ok|oka
                    r"that(?:'s| is| will be) (?:it|all|everything)|nothing(?: else| more| at all)?|never mind|"
                    r"not (?:now|today|right now|really)|all good|i (?:do not|don'?t) (?:need anything(?: else)?|think so)|no)")
 _DECLINE_PHRASE = re.compile(rf"(?:{_NO_WORD})?(?:{_DECLINE_CLAUSE}\s*){{0,2}}", re.IGNORECASE)
-_SAYS_NO = re.compile(r"\b(no|nope|nah|nothing|never mind|not (now|today|really)|that('s| is| will be) (it|all|everything)|"
+_SAYS_NO = re.compile(r"\b(no|now|nope|nah|nothing|never mind|not (now|today|really)|that('s| is| will be) (it|all|everything)|"
                       r"i('m| am) (good|fine|ok|okay|all right|alright|all set)|all good|everything('s| is) (fine|ok|okay|good)|"
                       r"(do not|don'?t) (need|think))\b", re.IGNORECASE)
 

@@ -43,7 +43,8 @@ CHECKIN = (
     "like you were not listening. Ask what they have planned today; when they tell you, say something "
     "about it and work today's weather into that (one sentence: going out means what to wear; staying in, "
     "just what it is like outside; the weather is given at the end of this note, so there is nothing to "
-    "look up). Save plans and anything else worth keeping. "
+    "look up). The weather is mentioned once, there and nowhere else: not before they have told you their "
+    "plans, and not again when you offer more. Save plans and anything else worth keeping. "
     "Keep it to a few exchanges. Your remark about their plans and the weather is the last one: put the "
     "offer of more in the same `ask`, as always, and after their no, wish them a good day."
 )

@@ -166,7 +166,8 @@ and close as always: tell them it is sent and offer more, in one `ask`.
 
 
 NOTE_TO_SELF = re.compile(
-    r"\b(end of (the )?task|task (is )?(complete|completed|finished|done)|no (further|additional|more) "
+    r"\b(end of (the )?task|(task|check-?in|reminder|conversation|visit) (is )?(complete|completed|finished|done|over|ended)|"
+    r"no (further|additional|more) "
     r"(spoken )?(response|action|output|speech)|nothing (further|more) to (say|do)|closing (text|summary)|"
     r"log entry|private note|the person (said|replied|answered|confirmed)|no reply (was )?heard)\b", re.IGNORECASE)
 
