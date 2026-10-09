@@ -368,3 +368,59 @@ def test_something_resting_against_his_back_is_not_a_pet_over_and_over():
 
     feed(w, False, 20, start=999.0)
     assert not w.resting_on_something(seconds=120), "released again"
+
+
+def test_a_deaf_kin_reports_his_own_fault_not_her_absence(memory, family):
+    """"I have not seen or heard Jennie today" drawn from a broken microphone is a false claim about a
+    person's wellbeing, and it was one presence deadline away from being sent (Oct 3)."""
+    from kin import alerts
+
+    assert alerts.report_deaf(memory, family) is not None
+    assert "fault at my end" in family.sent[0] and "says nothing about her" in family.sent[0]
+    assert alerts.report_deaf(memory, family) is None, "once a day"
+
+    assert alerts.report_absence(memory, family) is not None, "the absence path is untouched"
+
+
+def test_the_persona_is_a_friend_without_the_nursing_home_we():
+    """Oct 3: switched to a warm-buddy tone and a female voice. "How lovely we look" is the first-person
+    plural aimed at one person - belittling even when kindly meant - so the prompt forbids it, and the
+    nightly audit watches for it."""
+    from kin.agent import SYSTEM_PROMPT
+    from kin.nightly import SELF_CHECK_PROMPT
+
+    assert 'Never say "we" about anything that is hers alone' in SYSTEM_PROMPT
+    assert "No baby talk" in SYSTEM_PROMPT and "not a nurse" in SYSTEM_PROMPT
+    assert "belittling" in SELF_CHECK_PROMPT and "her_body" in SELF_CHECK_PROMPT
+
+
+def test_the_camera_may_not_report_on_her_body_or_mood():
+    """The VLM will volunteer "looks tired" or "appears pale" about a person: a health guess dressed up
+    as observation, and the least controlled part of the system."""
+    from kin.agent import SYSTEM_PROMPT
+
+    assert "never pass on what it says about a *person*" in SYSTEM_PROMPT
+    for guess in ("tired", "pale", "unwell", "sad"):
+        assert guess in SYSTEM_PROMPT
+
+
+def test_a_friendlier_kin_still_invents_no_abilities():
+    from kin.agent import SYSTEM_PROMPT
+
+    assert "Being friendly is not a reason to invent one" in SYSTEM_PROMPT
+    assert "being asked warmly or repeatedly does not change it" in SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("reply, declined", [
+    ("No.", True), ("No, thank you.", True), ("No, I'm good. Thank you.", True), ("No, that's it. Thank you.", True),
+    ("Now I'm good", True),                   # Whisper's "No" often comes out as "Now"
+    ("Anything else? No, thank you.", True),  # the microphone caught the tail of Kin's own question first
+    ("Nothing, never mind.", True), ("Not today.", True), ("I don't think so.", True), ("I'm all set, thank you", True),
+    ("Yes", False), ("Yes, one more thing.", False), ("No, but what's the weather?", False),
+    ("No, can you remind me at 8?", False), ("Not really, actually could you call my daughter", False),
+    ("Thank you.", False), ("No?", False), ("or november no, nelson", False), ("", False),
+])
+def test_a_plain_no_to_an_offer_of_more_is_a_decline_and_a_no_with_a_request_in_it_is_not(reply, declined):
+    from kin.tools import is_decline
+
+    assert is_decline(reply) is declined

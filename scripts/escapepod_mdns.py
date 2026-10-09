@@ -50,7 +50,8 @@ info = ServiceInfo(
 )
 
 zc = Zeroconf(interfaces=[ip], ip_version=IPVersion.V4Only)
-zc.register_service(info)
+# wire-pod answers for the same name too (IPv6 only on some PCs); cooperate instead of refusing to start.
+zc.register_service(info, cooperating_responders=True)
 print(f"Publishing escapepod.local -> {ip}. Ctrl+C to stop.")
 
 direct = None

@@ -8,7 +8,7 @@ from typing import Callable
 import anki_vector
 from anki_vector.util import degrees, distance_mm, speed_mmps
 
-from kin import alerts, config, family, llm, search, weather
+from kin import alerts, config, family, llm, search, weather, wirepod
 from kin import robot as kin_robot
 from kin.memory import Memory
 from kin.robot import call
@@ -18,6 +18,7 @@ MAX_DRIVE_MM = 150
 MAX_TURN_DEG = 180
 HEAD_UP_DEG = 35
 NO_REPLY = "no reply heard"  # what `ask` returns when nobody answered
+TRICK_SECONDS = 90  # how long Vector is left to himself after being asked for one of his own behaviours
 REPLIED = "the person replied: "  # and how its result begins when somebody did
 # With the reason: a bare "please put me on my charger" from a fully charged robot sounded like a fault.
 ASK_FOR_A_LIFT = ("Ask the person, once and politely, to put you on it, and say why: you cannot get back to it "
@@ -166,6 +167,17 @@ WEB_SEARCH_SPEC = _spec(
 )
 
 
+VECTOR_TRICK_SPEC = _spec(
+    "vector_trick",
+    "Hand the request back to Vector's own body for something only he does: fetching or playing with his "
+    "cube, dancing, a fist bump, taking a photo himself, driving to his charger, going to sleep, exploring. "
+    "Use it whenever the person asks for one of these, even if the words came through garbled ('french cube' "
+    "is 'fetch the cube'). He does it as himself; you stand back and say nothing about it afterwards.",
+    {"trick": {"type": "string", "enum": sorted(wirepod.TRICKS)}},
+    ["trick"],
+)
+
+
 NOTIFY_FAMILY_SPEC = _spec(
     "notify_family",
     "Send a short text message to the person's family. Use it when the person asks you to pass something on, "
@@ -178,7 +190,7 @@ NOTIFY_FAMILY_SPEC = _spec(
 
 def tool_specs() -> list[dict]:
     """The tools offered to the model. Optional tools appear only when configured, so Kin never promises them otherwise."""
-    specs = list(TOOL_SPECS)
+    specs = list(TOOL_SPECS) + [VECTOR_TRICK_SPEC]
     if search.available():
         specs.append(WEB_SEARCH_SPEC)
     if family.available():
@@ -210,6 +222,33 @@ _CLOSING = re.compile(r"anything (else|more)|else (i can|you need|can i)", re.IG
 def is_closing_offer(question: str) -> bool:
     """Does this question end a conversation with an offer of more? Silence is the usual answer to it."""
     return bool(_CLOSING.search(question))
+
+
+# One phrase of a "no" to an offer of more: "No, thank you.", "Now I'm good" (Whisper's "No" is often "Now"),
+# "That's it.", "Nothing, never mind." A decline is short and made only of such phrases; anything with a
+# request in it ("No, but what's the weather?") is not one, and the planner carries on as before.
+_NO_WORD = r"(?:no|nope|nah|now|not)\b\s*"
+_DECLINE_CLAUSE = (r"(?:thank you(?: very much)?|thanks|i'?m (?:good|fine|ok|okay|all right|alright|all set)|"
+                   r"i am (?:good|fine|okay)|everything(?:'s| is) (?:fine|ok|okay|good)|"
+                   r"that(?:'s| is| will be) (?:it|all|everything)|nothing(?: else| more| at all)?|never mind|"
+                   r"not (?:now|today|right now|really)|all good|i (?:do not|don'?t) (?:need anything(?: else)?|think so)|no)")
+_DECLINE_PHRASE = re.compile(rf"(?:{_NO_WORD})?(?:{_DECLINE_CLAUSE}\s*){{0,2}}", re.IGNORECASE)
+_SAYS_NO = re.compile(r"\b(no|nope|nah|nothing|never mind|not (now|today|really)|that('s| is| will be) (it|all|everything)|"
+                      r"i('m| am) (good|fine|ok|okay|all right|alright|all set)|all good|everything('s| is) (fine|ok|okay|good)|"
+                      r"(do not|don'?t) (need|think))\b", re.IGNORECASE)
+
+
+def is_decline(reply: str) -> bool:
+    """Is this reply to an offer of more a plain no, and nothing else?"""
+    text = reply.strip()
+    if "?" in text:  # the microphone caught the tail of Kin's own question first: "Anything else? No, thank you."
+        before, _, after = text.rpartition("?")
+        if len(before.split()) >= 2:
+            text = after
+    if len(text.split()) > 12:
+        return False
+    phrases = [p.strip() for p in re.split(r"[,.!;]+", text.lower()) if p.strip()]
+    return bool(phrases) and all(_DECLINE_PHRASE.fullmatch(p) for p in phrases) and any(_SAYS_NO.search(p) for p in phrases)
 
 
 def is_echo(question: str, reply: str) -> bool:
@@ -323,6 +362,18 @@ class RobotTools:
         sent = self.family.send(f"Kin: {message}")
         self.memory.log_event("family_out", message)
         return f"sent to {sent} family member(s)" if sent else "error: the message could not be sent"
+
+    def _tool_vector_trick(self, trick: str) -> str:
+        intent = wirepod.TRICKS.get(trick.strip().lower().replace(" ", "_").replace("-", "_"))
+        if intent is None:
+            return f"error: '{trick}' is not one of his tricks; they are {', '.join(sorted(wirepod.TRICKS))}"
+        kin_robot.let_him_be(TRICK_SECONDS)   # no control, no tasks, while his own behaviour runs
+        kin_robot.hand_back(self.robot)
+        if not wirepod.run_intent(intent):
+            return "error: could not ask him to do it (wire-pod did not accept it)"
+        self.memory.log_event("vector_intent", f"Kin asked him to {trick.replace('_', ' ')}")
+        return (f"he is doing it himself now. Do not describe it or move him; if you say anything, keep it to "
+                "a few words and then finish.")
 
     def _tool_weather(self, place: str = "") -> str:
         return weather.report(place)

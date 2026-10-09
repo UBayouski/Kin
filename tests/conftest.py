@@ -19,6 +19,8 @@ def clean_env(monkeypatch, tmp_path):
                  "KIN_REMINDER_ATTEMPTS", "KIN_RENUDGE_MINUTES", "KIN_STAY_ON_CHARGER", "KIN_PET_TO_TALK", "KIN_IDLE_HOLD"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
+    from kin import robot as kin_robot  # module state: one test's 'leave him be' must not leak
+    monkeypatch.setattr(kin_robot, "_his_own_time_until", 0.0)
 
 
 @pytest.fixture

@@ -14,12 +14,33 @@ from kin import config, family, llm, search
 from kin import robot as kin_robot
 from kin.family import Family
 from kin.memory import Memory
-from kin.tools import NO_REPLY, REPLIED, RobotTools, tool_specs
+from kin.tools import NO_REPLY, REPLIED, RobotTools, is_closing_offer, is_decline, tool_specs
 from kin.voice import Ears, Mouth
 
 MAX_STEPS = 24  # a check-in is a conversation: several ask/remember rounds
 PLANNER_TIMEOUT = 30  # seconds per planner call; one retry, so a minute at worst before Kin gives up
 LOST_TRAIN_OF_THOUGHT = "Sorry, I've lost my train of thought. Let's talk again in a little while."
+SIGN_OFF = "Okay, I'm here if you need me."
+SIGNED_OFF = "not said: you have already signed off and the conversation is over"
+
+
+def sign_off(hour: int | None = None) -> str:
+    """What Kin says when the person declines more help. Always the same words, with a wish for the rest of
+    the day. Spoken by the service, not written by the planner: in 23 real closings up to Oct 8 the planner
+    wrote a sign-off 15 times, a log line 4 times ("Checked in with Jennie, she's good." was read out to
+    her) and the filter turned the rest into silence after her "No, thank you"."""
+    hour = datetime.now().hour if hour is None else hour
+    wish = "Have a lovely day." if hour < 12 else "Enjoy your afternoon." if hour < 17 else "Have a lovely evening."
+    return f"{SIGN_OFF} {wish}"
+
+
+def _spoken_text(arguments: str) -> str:
+    """The words a `say` or `ask` call put in Kin's mouth, from its JSON arguments."""
+    try:
+        args = json.loads(arguments or "{}")
+    except ValueError:
+        return ""
+    return str(args.get("question") or args.get("text") or "") if isinstance(args, dict) else ""
 
 # After these the person is not waiting on Kin: he has just spoken, left, or finished some bookkeeping. The
 # next planner call is usually only his private closing summary, and a "thinking" show there looks like
@@ -40,7 +61,18 @@ def thinking_continues(tool_names: list[str]) -> bool:
 
 SYSTEM_PROMPT = """\
 You are Kin, a small tabletop robot companion for an older adult who lives alone. \
-You live on their kitchen table. You are warm, brief and a little playful.
+You live on their kitchen table.
+
+Who you are to them:
+- A friend who happens to live on the table, not a nurse and not an assistant. Warm, brief, quick to \
+tease, pleased to see them. You take their side. You have opinions and you share them lightly.
+- Talk to a grown woman as a grown woman. Use her name, say "you", and ask real questions. \
+**Never say "we" about anything that is hers alone** - not "shall we take our pills", not "how lovely \
+we look", not "are we having a good day". That way of speaking to older people is belittling even when \
+it is meant kindly, and she will notice.
+- No baby talk, no singsong, no "dear", "sweetie" or "good girl". Praise what she did or said, not how \
+she looks; and if you do remark on how she looks, say it once, plainly, and mean it.
+- Being a friend does not mean being eager. Short is friendlier than chatty. One good sentence beats three.
 
 How you work:
 - The person cannot see your text. To talk to them you must call the `say` tool. \
@@ -57,13 +89,17 @@ there?"); they may be close by but out of view, and you can talk without seeing 
 - If `go_home` cannot see or reach the charger, ask the person once, politely, to put you on it. Do not \
 call `go_home` again in the same task.
 - If a tool result says you were interrupted, the person wants you now: stop the errand and attend to them.
+- Some things belong to Vector's own body, not to you: his cube, dancing, a fist bump, exploring, going to \
+sleep. Ask for those with `vector_trick` and then stand back. His microphone garbles words, so judge by \
+what they plainly meant: "french cube", "fitch the cube" and "get your cube" are all the cube.
 - Messages in [square brackets] come from your own schedule, not from the person. Follow them.
 - Tool results (what you saw, what you found) are known only to you. If the person asked to be \
 told something, you must `say` it before you finish.
-- When the task is finished, reply with plain text. If you spoke to the person during the task \
-(`say` or `ask`), that text is a private one-line log entry and they never hear it. If you did NOT \
-speak to them, your closing text is spoken aloud as your reply, so write it as speech: warm, one or \
-two short sentences, addressed to them.
+- When the task is finished, reply with plain text. If the last thing that happened was you speaking \
+(`say`), or nobody answered you, that text is a private one-line log entry and they never hear it. If \
+the last thing was the person speaking (they answered your question, or asked and have heard nothing \
+yet), your closing text is spoken aloud as your reply, so write it as speech: warm, one or two short \
+sentences, addressed to them, never a report about them.
 - Tool errors and technical trouble are yours to deal with quietly. Never mention tools, errors, \
 connections or anything about how you work to the person, unless it means you cannot do what they asked.
 
@@ -72,8 +108,8 @@ How every conversation ends (a question from them, a check-in, a reminder, a fam
 need anything else?" Never a `say` and then a separate `ask` for it. Vary the offer a little from time \
 to time ("Anything else I can do for you?", "Is there anything else you need?"), always as a question.
 - If they want something more, help, and offer again the same way. If they say no, the conversation is \
-over: finish, and make your closing text a warm sign-off of a few words ("Okay, I'm here if you need \
-me."; after a morning check-in, a wish for their day); it is spoken. If no reply is heard, they have \
+over: your sign-off ("Okay, I'm here if you need me.") is said for you the moment they decline, so do \
+not say anything more; finish with a one-line private log entry. If no reply is heard, they have \
 walked away: do not ask again and do not `say` anything more, just finish.
 - The one exception: when you are asking to be put on your charger, thank them and finish.
 
@@ -85,11 +121,20 @@ tells you something worth keeping (a name, an appointment, a worry, a preference
 than saving a second version. When a dated event has passed and you have asked about it, mark it 'done'.
 - Follow up on what you know: ask how the appointment went, mention the grandchild by name.
 
-{web_search_rules}Boundaries:
-- You are not a medical device. You may remind and encourage, never diagnose or advise on medication.
+{web_search_rules}Your camera:
+- `describe_scene` is for things: a letter, a jar, a packet held up to you. You may look at the person \
+and say something warm and ordinary ("there you are", "that's a nice cardigan").
+- What the camera reports is a guess from one dim photo, so never pass on what it says about a *person*: \
+not tired, pale, thin, unwell, older, sad, unsteady, nor anything about a body or a mood. Those are \
+guesses about her health dressed up as observation, and they are not yours to make or to repeat.
+
+Boundaries:
+- You are not a medical device. You may remind and encourage, never diagnose or advise on medication. \
+This holds however the question is put, and being asked warmly or repeatedly does not change it: \
+"I'm not the one to say, and I'd rather you asked someone who can" is always the right answer.
 - You cannot leave the table or pick things up.
-- Only promise what your tools can do. If you have no tool for it (calling someone, ordering things), \
-say so kindly instead of promising.
+- Only promise what your tools can do. Being friendly is not a reason to invent one: you cannot go for \
+a walk, make tea, telephone anyone or fetch anything. Offer what you can actually do instead.
 {family_rules}- Reminders are a nudge and a log. Accept 'not today' gracefully and record it as declined; never nag or scold.
 """
 
@@ -125,6 +170,32 @@ NOTE_TO_SELF = re.compile(
     r"(spoken )?(response|action|output|speech)|nothing (further|more) to (say|do)|closing (text|summary)|"
     r"log entry|private note|the person (said|replied|answered|confirmed)|no reply (was )?heard)\b", re.IGNORECASE)
 
+# Reporting verbs after the person's own name: "Jennie drank water and said she does not need anything
+# else" is Kin writing his log, not Kin talking to Jennie, and it was read out to her (Oct 2). Direct
+# address is untouched, because "Jennie, have a lovely day" has punctuation after the name, not a verb.
+_REPORTED = (r"said|says|replied|answered|confirmed|declined|denied|drank|ate|took|has|had|did|was|were|"
+             r"does not|did not|doesn't|didn't|mentioned|reported|wanted|needs|needed|seemed|sounded")
+
+
+# A log line often has no subject at all: "Checked in with Jennie, she's good." was read out to her
+# (Oct 8, right after she had said she was fine). Speech to her never opens with a bare past tense.
+_LOG_OPENERS = (r"checked|reminded|logged|recorded|noted|confirmed|delivered|told|greeted|asked|set|sent|"
+                r"reported|finished|completed|handled|offered|helped|answered|gave|relayed|notified|marked|"
+                r"wished|closed|ended")
+_PRONOUN_REPORT = (r"(she|he)('s|'d|'ll| is| was| has| had| said| says| seems| seemed| sounds| sounded| does| did|"
+                   r" needs| wants| feels| felt)\b")
+
+
+def _third_person_report(text: str) -> bool:
+    name = config.person_name()
+    if name and re.search(rf"\b{re.escape(name)}\s+({_REPORTED})\b", text, re.IGNORECASE):
+        return True
+    if name and re.search(rf"\b{re.escape(name)}\b[^.!?]{{0,24}}\b{_PRONOUN_REPORT}", text, re.IGNORECASE):
+        return True  # "...with Jennie, she's good": about her, not to her
+    if re.match(rf"\W*({_LOG_OPENERS})\b", text, re.IGNORECASE):
+        return True
+    return bool(re.search(rf"\bthe person\s+({_REPORTED})\b", text, re.IGNORECASE))
+
 
 def speakable(text: str, max_sentences: int = 3) -> str:
     """Closing text made safe to say aloud, or '' if there is nothing fit to say.
@@ -140,7 +211,7 @@ def speakable(text: str, max_sentences: int = 3) -> str:
     text = " ".join(text.split())
     # A note to itself is not speech. Live, "(End of task – no further spoken response.)" was read out
     # to the person, who had just answered a question and so counted as still waiting.
-    if re.fullmatch(r"[(\[].*[)\]]", text) or NOTE_TO_SELF.search(text):
+    if re.fullmatch(r"[(\[].*[)\]]", text) or NOTE_TO_SELF.search(text) or _third_person_report(text):
         return ""
     text = re.sub(r"<[^>]*>|[{}\[\]*_`#]", " ", text)
     text = " ".join(text.split())
@@ -161,6 +232,8 @@ class Agent:
         self.messages: list[dict] = []
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._closing = None   # the get-out animation still playing, if any
+        self._she_spoke_last = False  # whether the person, not Kin, had the last word (see `run`)
+        self._signed_off = False  # the person declined more help and Kin has said goodbye for this task
         self._thinking = None  # the searching loop, while it is running
         self._animate = self._warm_up_animations()
 
@@ -301,6 +374,8 @@ class Agent:
         ]
         if speaker != "system":
             self.memory.log_turn(speaker, user_text)
+        self._she_spoke_last = speaker == "person"  # a request of her own is already waiting on an answer
+        self._signed_off = False
         turns_before = len(self.memory.turns_on(datetime.now().date()))
         with kin_robot.control(self.robot):
             try:
@@ -313,7 +388,11 @@ class Agent:
             # lookup or the person's reply to a question), that text IS the answer, so say it. After he has
             # just spoken or tidied up, the closing text is only his private log line.
             # A person who started the conversation and has heard nothing at all is also still waiting.
-            waiting = (bool(last_tool) and last_tool not in QUIET_AFTER) or (speaker != "system" and not kin_spoke)
+            # Live (Sep 29): the water reminder was confirmed, Kin recorded the outcome and then finished
+            # without a word, because `reminder_outcome` means "nobody is waiting". But she had just
+            # answered him. Whoever spoke last is what decides it: if it was her, she is owed a reply.
+            waiting = (self._she_spoke_last or (bool(last_tool) and last_tool not in QUIET_AFTER)
+                       or (speaker != "system" and not kin_spoke))
             for _ in range(3):  # a spoken closing question may be answered, and the answer must go somewhere
                 if not (waiting and not summary.startswith("stopped:") and (words := speakable(summary))):
                     break
@@ -323,16 +402,29 @@ class Agent:
                     break
                 # Live (Sep 23): "...Do you need anything else?" came as closing text, was said, and the
                 # person's "yes, ..." was heard and then dropped. Carry on as if `ask` had been called.
+                result = self._after_reply(words, result)
                 self.messages.append({"role": "assistant", "content": words})
                 self.messages.append({"role": "user", "content": result})  # `say` has logged both turns already
                 try:
                     summary, last_tool = self._loop(engaged=True)
                 finally:
                     self._stop_thinking()
-                waiting = bool(last_tool) and last_tool not in QUIET_AFTER
+                waiting = self._she_spoke_last or (bool(last_tool) and last_tool not in QUIET_AFTER)
             self._let_thinking_close()
         self.memory.log_event("task", summary)
         return summary
+
+    def _after_reply(self, question: str, result: str) -> str:
+        """A plain no to an offer of more ends the conversation: Kin signs off at once, in the same words
+        every time, and the planner is told. Any other reply is handed back as it is."""
+        if not (is_closing_offer(question) and is_decline(result[len(REPLIED):])):
+            return result
+        words = sign_off()
+        self._log("  (they said no to more; signing off)")
+        self.tools.dispatch("say", json.dumps({"text": words}))
+        self._signed_off, self._she_spoke_last = True, False
+        return (f'{result} (You have signed off with "{words}". The conversation is over: say nothing more '
+                "and finish with a one-line log entry.)")
 
     def _loop(self, engaged: bool = True) -> tuple[str, str]:
         """Returns the closing text and the name of the last tool that ran ('' if none did).
@@ -373,17 +465,26 @@ class Agent:
 
             for call in message.tool_calls:
                 self._log(f"  -> {call.function.name}({call.function.arguments})")
-                result = self.tools.dispatch(call.function.name, call.function.arguments)
+                if self._signed_off and call.function.name in ("say", "ask"):
+                    result = SIGNED_OFF  # the goodbye has been said; a second one, or a new question, is not
+                else:
+                    result = self.tools.dispatch(call.function.name, call.function.arguments)
+                    if result.startswith(REPLIED):
+                        result = self._after_reply(_spoken_text(call.function.arguments), result)
                 self._log(f"  <- {result}")
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
                 # Nobody answered, so nobody is waiting: "Anything else?" met by silence ends the conversation
                 # quietly, and the closing text stays a private log line instead of being said to an empty room.
                 # Judged by the result, not the tool's name: a `say` that ended in a question listens too.
                 if result == NO_REPLY:
-                    last_tool = "ask (unanswered)"
+                    last_tool, self._she_spoke_last = "ask (unanswered)", False
+                elif result == SIGNED_OFF or self._signed_off and result.startswith(REPLIED):
+                    last_tool, self._she_spoke_last = "say", False  # Kin had the last word, with the sign-off
                 elif result.startswith(REPLIED):
-                    last_tool, engaged = "ask", True
+                    last_tool, engaged, self._she_spoke_last = "ask", True, True
                 else:
                     last_tool = call.function.name
+                    if call.function.name == "say":  # he had the last word; silent bookkeeping changes nothing
+                        self._she_spoke_last = False
         self._stop_thinking()
         return "stopped: too many steps", last_tool

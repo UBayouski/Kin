@@ -134,3 +134,47 @@ def test_skipping_the_tail_gives_up_after_a_second_of_noise():
         ears._blocks.put(block)
 
     assert abs(ears._skip_speaker_tail() - 1.0) < 0.01
+
+
+def test_a_dead_microphone_is_told_from_a_quiet_room():
+    """Oct 3: the Windows default input had become a webcam delivering silence. Kin called out twice,
+    "heard" nothing, and was one presence deadline away from telling the family nobody was home."""
+    def silent_at(level):
+        ears = make_ears([], [])
+        ears._dead_listens = 0
+
+        def record(timeout):          # what `_utterance` does when nobody speaks
+            ears._loudest = level
+            return None
+        ears._record = record
+        return ears
+
+    webcam = silent_at(0.00003)       # what the wrong device gave
+    for _ in range(4):
+        webcam.listen(timeout=1)
+    assert webcam.seems_deaf()
+
+    room = silent_at(0.0027)          # a real room with nobody talking
+    for _ in range(4):
+        room.listen(timeout=1)
+    assert not room.seems_deaf(), "an empty quiet room is not a broken microphone"
+
+
+def test_hearing_words_clears_the_deaf_count():
+    ears = make_ears(captures=[seconds_of_sound(2)], transcripts=["I'm here."])
+    ears._dead_listens = 2
+
+    assert ears.listen(timeout=5) == "I'm here."
+    assert ears._dead_listens == 0 and not ears.seems_deaf()
+
+
+def test_hub_speech_ends_with_a_little_silence():
+    """Oct 8: the last letters of every sentence were clipped; the output device closed on the final sample."""
+    from kin.voice import with_tail
+
+    audio = np.full(1000, 1234, dtype=np.int16)
+    padded = with_tail(audio, sample_rate=22050, seconds=0.3)
+
+    assert padded.dtype == np.int16
+    assert len(padded) == 1000 + int(22050 * 0.3)
+    assert padded[:1000].tolist() == audio.tolist() and not padded[1000:].any()

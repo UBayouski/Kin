@@ -23,6 +23,30 @@ LISTEN_RATE = 16000
 _BLOCK_SECONDS = 0.1
 _LEAD_IN_BLOCKS = 4  # 0.4 s kept from just before the voice crossed the threshold
 _FLOOR_CAP = 0.006   # the room's background level is never taken to be more than this (speech is 0.03 to 0.1 here)
+_DEAD_LEVEL = 0.0002  # quieter than any real room: the input device is giving us nothing (see `seems_deaf`)
+
+
+def device_id(setting: int | str | None, kind: str) -> int | None:
+    """Turn a `KIN_AUDIO_*` setting into one device index.
+
+    A name fragment is matched here rather than left to sounddevice, which refuses a fragment that hits
+    the same hardware on several host APIs ("Multiple input devices found for 'QuadCast'": MME,
+    DirectSound, WASAPI, WDM-KS all list it). The same thing happens on Linux with ALSA and PipeWire
+    entries. Pinning a name matters: on Oct 3 the Windows default input had become a webcam that delivers
+    silence, and the 09:00 check-in called out twice and heard nothing.
+    """
+    if setting is None or isinstance(setting, int):
+        return setting
+    import sounddevice as sd
+
+    channels = "max_input_channels" if kind == "input" else "max_output_channels"
+    wanted = setting.strip().lower()
+    matches = [i for i, d in enumerate(sd.query_devices()) if d[channels] > 0 and wanted in d["name"].lower()]
+    if not matches:
+        raise RuntimeError(f"no {kind} device matching {setting!r}; `python scripts/voices.py devices` lists them")
+    default_api = sd.default.hostapi
+    on_default = [i for i in matches if sd.query_devices(i)["hostapi"] == default_api]
+    return (on_default or matches)[0]
 
 
 class Mouth(Protocol):
@@ -45,6 +69,12 @@ class VectorMouth:
         from kin.robot import call
 
         call(self.robot.behavior.say_text, text, duration_scalar=config.speech_slowdown(), timeout=60)
+
+
+def with_tail(audio: np.ndarray, sample_rate: int, seconds: float = 0.3) -> np.ndarray:
+    """The audio followed by a little silence. Piper ends exactly on the last sound and the output device
+    closed on it, so the last letters of every sentence were clipped (Oct 8, on the hub speaker)."""
+    return np.concatenate([audio, np.zeros(int(sample_rate * seconds), dtype=audio.dtype)])
 
 
 class HubMouth:
@@ -77,11 +107,11 @@ class HubMouth:
         chunks = list(self._voice.synthesize(text, syn_config=self._config))
         if not chunks:
             return
-        audio = np.concatenate([c.audio_int16_array for c in chunks])
+        audio = with_tail(np.concatenate([c.audio_int16_array for c in chunks]), chunks[0].sample_rate)
         print(f"  (voice ready in {time.perf_counter() - started:.1f}s, "
               f"{len(audio) / chunks[0].sample_rate:.1f}s to say)", flush=True)
         with self._talking():
-            sd.play(audio, samplerate=chunks[0].sample_rate, device=config.audio_output_device())
+            sd.play(audio, samplerate=chunks[0].sample_rate, device=device_id(config.audio_output_device(), "output"))
             sd.wait()
 
     def _talking(self):
@@ -117,6 +147,19 @@ class HubEars:
 
         self._model = WhisperModel(config.whisper_model(), device="cpu", compute_type="int8")
         self._noise_floor: float | None = None
+        self._loudest = 1.0        # the loudest level of the last listen that heard nothing
+        self._dead_listens = 0     # how many in a row were not merely quiet but silent (see `seems_deaf`)
+
+    def seems_deaf(self) -> bool:
+        """Is the microphone giving us nothing at all?
+
+        A real room has a floor: 0.0003 to 0.006 here. A dead or wrong input device reads near zero, and
+        on Oct 3 it did, because the Windows default input had become a webcam. Kin then called out twice,
+        "heard" silence, and was one presence deadline away from telling the family nobody was home - a
+        claim about a person's wellbeing drawn from his own broken ear. Three in a row, so one quiet
+        listen in a soundproof room is not enough.
+        """
+        return self._dead_listens >= 3
 
     def prepare(self) -> None:
         """Open the microphone now, before Kin asks his question, so it is already running when he stops.
@@ -130,7 +173,7 @@ class HubEars:
             blocks: queue.Queue[np.ndarray] = queue.Queue()
             self._blocks = blocks
             self._stream = sd.InputStream(
-                samplerate=LISTEN_RATE, channels=1, dtype="float32", device=config.audio_input_device(),
+                samplerate=LISTEN_RATE, channels=1, dtype="float32", device=device_id(config.audio_input_device(), "input"),
                 blocksize=int(LISTEN_RATE * _BLOCK_SECONDS), callback=lambda data, *_: blocks.put(data[:, 0].copy()),
             )
             self._stream.start()
@@ -201,6 +244,7 @@ class HubEars:
                 # Live, a "no, thank you" went unheard with nothing in the log to say why; these numbers do.
                 print(f"  (heard nothing for {timeout:.0f}s: loudest {peak:.4f} against a threshold of "
                       f"{threshold:.4f}, room {self._noise_floor:.4f})", flush=True)
+                self._loudest = peak
                 return None
         return np.concatenate(heard) if heard else None
 
@@ -230,12 +274,17 @@ class HubEars:
                 self._blocks.get_nowait()
             self._skip_speaker_tail()
         self._noise_floor = None  # measured afresh each time; what the room was like an hour ago is no guide
+        self._loudest = 1.0
         try:
             deadline = time.monotonic() + timeout
             while (remaining := deadline - time.monotonic()) > 0.5:
                 started = time.perf_counter()
                 audio = self._record(remaining)
                 if audio is None:
+                    self._dead_listens = self._dead_listens + 1 if self._loudest < _DEAD_LEVEL else 0
+                    if self.seems_deaf():
+                        print(f"  (the microphone is giving us nothing: loudest {self._loudest:.5f} over "
+                              f"{self._dead_listens} listens; check KIN_AUDIO_INPUT)", flush=True)
                     return None  # silence to the end
                 recorded = time.perf_counter()
                 text = ""
@@ -246,6 +295,7 @@ class HubEars:
                       f"they had finished; transcribed in {time.perf_counter() - recorded:.1f}s"
                       f"{'' if text else '; no words in it, still listening'})", flush=True)
                 if text:
+                    self._dead_listens = 0
                     return text
             return None
         finally:

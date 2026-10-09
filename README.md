@@ -84,7 +84,9 @@ python scripts/03_vector_sees.py
 ## Run Kin
 
 ```powershell
-python -m kin.service                        # runs all day, no keyboard needed
+.\scripts\hub.ps1                            # Windows hub: wire-pod + mDNS helper + the Kin service, restarted if it exits, logged to data\logs
+.\scripts\hub.ps1 -Install                   # ...and run all of that at logon as a scheduled task (-Status, -Uninstall)
+python -m kin.service                        # the service alone; runs all day, no keyboard needed
 python -m kin.service --checkin-now --once   # do one check-in now and exit
 ```
 

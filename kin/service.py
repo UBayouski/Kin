@@ -68,6 +68,7 @@ OFF_DOCK_GRACE_SECONDS = 120     # off the charger this long with nothing to do,
 RETURN_HOME_EVERY_SECONDS = 1800  # and again no sooner than this if it failed (each try is a slow turn)
 ACK_SECONDS = 3.5      # how long Vector needs to say "On it!" himself before Kin takes over
 HEARD_STALE_MINUTES = 3
+FAMILY_COMMANDS = ("/start", "/help", "/status", "/digest", "/week")  # answered from memory; no robot needed
 TOUCHED = (
     "[The person petted your back to get your attention. Greet them and ask what they need in ONE `ask` "
     "call, for example 'Hello Jennie, what can I do for you?'. Do not `say` a greeting first: that makes "
@@ -121,6 +122,7 @@ class Service:
         self._raw_volts = -1.0  # the previous reading, whatever it was
         self._hold_refusals = 0
         self._report_on_charger = True  # what the battery report last said; the status stream can go stale
+        self._delayed: set[int] = set()  # family messages the sender has been told are waiting for the robot
         self._warmed_for: int | str | None = None  # the heard request (or "checkin") the planner was last warmed up for
         self._body_lost_since: float | None = None
         self._off_dock_since: float | None = None
@@ -168,18 +170,8 @@ class Service:
 
     def _handle_family_message(self, agent: Agent, chat_id: int, sender: str, text: str, received_at: str) -> bool:
         command = text.split()[0].lower()
-        if command in ("/start", "/help"):
-            self.family.send(
-                "I'm Kin. Send me any message and I will deliver it in person and tell you the reply.\n"
-                "/status - how today is going\n/digest - today's note now\n/week - patterns over the last week",
-                chat_id=chat_id,
-            )
-        elif command == "/status":
-            self.family.send(digest.status(self.memory), chat_id=chat_id)
-        elif command == "/digest":
-            self.family.send(digest.build(self.memory), chat_id=chat_id)
-        elif command == "/week":
-            self.family.send("Kin's weekly note\n\n" + nightly.latest_trends(self.memory), chat_id=chat_id)
+        if command in FAMILY_COMMANDS:
+            self._run_family_command(chat_id, command)
         else:
             log(f"family message from {sender}")
             self.memory.log_event("family_in", f"{sender}: {text}")
@@ -223,6 +215,10 @@ class Service:
             last = self.memory.last_sign_of_person(today)
             if last and last >= started:
                 log("presence check: the person is here")
+            elif getattr(self.ears, "seems_deaf", bool)():
+                # He called out and his own microphone gave him nothing: that is no evidence about her.
+                if alert := alerts.report_deaf(self.memory, self.family):
+                    log(f"alert: {alert}")
             elif alert := alerts.report_absence(self.memory, self.family):
                 log(f"alert: {alert}")
             # Only now the slow part. The family should not wait on a docking manoeuvre.
@@ -460,6 +456,9 @@ class Service:
         self._watch_movement(robot)
         self._heartbeat(robot)
         self._let_him_react(robot)
+        if kin_robot.busy_being_himself():  # one of his own behaviours is running; do not take him back
+            self.desk_work()
+            return False
         if self._rescue_battery(agent):
             return True
         if self._guard_unreadable_battery(robot, agent):
@@ -520,6 +519,19 @@ class Service:
         for alert in alerts.report_missed_reminders(self.memory, self.family):  # normally raised by the tool already
             log(f"alert: {alert}")
 
+        self.desk_work()
+        return False
+
+    def desk_work(self) -> None:
+        """Everything that needs no robot: the family's questions, the evening note, the nightly reflection.
+
+        Run whether or not the robot is reachable. He was unreachable for half of a three-day stretch
+        (Sep 29 to Oct 2), and because all of this used to live inside the robot's connection the family
+        got nothing at all on those days: no evening note, and no answer even to `/status`. The half of
+        the product that still works when the hardware is sick should keep working.
+        """
+        if self.family:
+            self._answer_family_questions()
         if self.family and datetime.now().strftime("%H:%M") >= config.digest_time() and not self._done_today("digest"):
             log("sending the family digest")
             note = digest.build(self.memory)
@@ -527,7 +539,7 @@ class Service:
             self.memory.log_event("digest_note", note)  # the weekly trends are built from these short notes
             self.memory.log_event("digest", f"sent to {sent} chat(s)")
             if datetime.now().strftime("%a").lower() == config.weekly_day():
-                self.family.send("Kin's weekly note\n\n" + nightly.latest_trends(self.memory))
+                self._send_weekly_note()
 
         if datetime.now().strftime("%H:%M") >= NIGHTLY_AT and not self._done_today("nightly"):
             log("nightly reflection: memory, weekly trends, self-check")
@@ -537,7 +549,44 @@ class Service:
             for _, kind, detail in self.memory.events_on(datetime.now().date()):
                 if kind == "self_check" and detail.startswith("[high]"):
                     log("SELF-CHECK " + detail)
-        return False
+
+    def _answer_family_questions(self, robot_reachable: bool = True) -> None:
+        """Answer every waiting /command, and when the robot is out of reach say so once for a message
+        that has to be delivered by voice, instead of leaving the sender in silence."""
+        while (row := self.memory.inbox_next()) is not None:
+            update_id, chat_id, sender, text, _ = row
+            if text.split()[0].lower() in FAMILY_COMMANDS:
+                self._run_family_command(chat_id, text.split()[0].lower())
+                self.memory.inbox_done(update_id)
+                continue
+            if robot_reachable:
+                return  # a message to deliver in person: the robot path takes it from here
+            if update_id not in self._delayed:
+                self._delayed.add(update_id)
+                log(f"family message from {sender} held until the robot is back")
+                self.family.send(
+                    "Thank you, I have your message. I cannot reach my robot at the moment, so I will "
+                    "deliver it as soon as he is back and tell you what she says.", chat_id=chat_id)
+            return  # leave it in the inbox, in order, for delivery later
+
+    def _run_family_command(self, chat_id: int, command: str) -> None:
+        if command in ("/start", "/help"):
+            self.family.send(
+                "I'm Kin. Send me any message and I will deliver it in person and tell you the reply.\n"
+                "/status - how today is going\n/digest - today's note now\n/week - patterns over the last week",
+                chat_id=chat_id)
+        elif command == "/status":
+            self.family.send(digest.status(self.memory), chat_id=chat_id)
+        elif command == "/digest":
+            self.family.send(digest.build(self.memory), chat_id=chat_id)
+        elif command == "/week":
+            self._send_weekly_note(chat_id=chat_id)
+
+    def _send_weekly_note(self, chat_id: int | None = None) -> None:
+        """The weekly note, on record. Until Oct 9 the send was not logged, so memory could not tell
+        whether the family had ever received one."""
+        sent = self.family.send("Kin's weekly note\n\n" + nightly.latest_trends(self.memory), chat_id=chat_id)
+        self.memory.log_event("weekly", f"sent to {sent} chat(s)" + (" on request" if chat_id else ""))
 
     def run(self) -> None:
         log(f"Kin service: mouth={config.mouth()} ears={config.ears()} check-in at {config.checkin_time()} "
@@ -592,6 +641,12 @@ class Service:
                 if minutes >= ROBOT_DOWN_MINUTES:
                     if alert := alerts.report_robot_down(self.memory, self.family, minutes):
                         log(f"alert: {alert}")
+                # The family side does not depend on the robot, so it carries on while he is out of reach.
+                try:
+                    self._answer_family_questions(robot_reachable=False)
+                    self.desk_work()
+                except Exception as desk:  # never let this stop the reconnecting
+                    log(f"error (while the robot is down): {type(desk).__name__}: {str(desk)[:120]}")
                 time.sleep(RECONNECT_SECONDS)
 
 

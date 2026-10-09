@@ -128,3 +128,56 @@ def test_a_mistyped_choice_setting_is_an_error_not_a_silent_default(monkeypatch,
 
     with pytest.raises(RuntimeError):
         config.mouth()
+
+
+def test_the_weekly_note_is_on_record_when_sent(memory, family):
+    """Until Oct 9 the Sunday send was not logged, so memory could not tell whether the family had ever
+    received a weekly note. Now both the Sunday send and /week leave a 'weekly' event."""
+    from datetime import date
+
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    kin.memory, kin.family = memory, family
+    memory.log_event("trends", "Water reminders were missed on Monday and Thursday.")
+
+    kin._send_weekly_note()
+    kin._run_family_command(chat_id=42, command="/week")
+
+    assert [s.startswith("Kin's weekly note\n\n") for s in family.sent] == [True, True]
+    assert "missed on Monday and Thursday" in family.sent[0]
+    weekly = [detail for _, kind, detail in memory.events_on(date.today()) if kind == "weekly"]
+    assert weekly == ["sent to 1 chat(s)", "sent to 1 chat(s) on request"]
+
+
+def test_the_weekly_note_is_about_the_person_not_the_robot(monkeypatch):
+    """The Sep 29 and 30 notes called the person's speech 'disjointed' and 'confused' (a guess about her
+    mind from a bad microphone) and most of them led with robot outages. The prompt now forbids both."""
+    prompts = []
+    monkeypatch.setattr(nightly, "_ask", lambda prompt, max_tokens=8000: prompts.append(prompt) or "A quiet week.")
+    day = {"day": "Mon 2026-10-05", "checkin": True, "spoke": 3, "reminders": {"drink water": "confirmed"},
+           "alerts": [], "note": "Jennie said her knee aches."}
+    payload = {"today": "Thursday, 2026-10-08", "person": "Jennie", "facts": "", "conversation": "",
+               "week": [day, dict(day, day="Tue 2026-10-06")]}
+
+    result = nightly.run(payload)
+
+    assert result["trends"] == "A quiet week."
+    prompt = prompts[0]
+    assert "It is about Jennie, not about the robot" in prompt
+    assert "never remark on how clearly they spoke, on confusion, forgetfulness or repetition" in prompt
+    assert "could not reach his robot, or has no record at all, says nothing about them" in prompt
+    assert "at most one short sentence at the very end" in prompt
+    assert "Jennie said her knee aches." in prompt, "the daily notes are the evidence it works from"
+
+
+def test_a_day_with_no_record_is_shown_as_kin_not_running():
+    """Oct 6 and 7 the hub was off. Shown as 'spoke 0x, no check-in' the model wrote that the person was
+    silent while the robot was working; an empty day is Kin's absence, not hers."""
+    empty = {"day": "Tue 2026-10-06", "checkin": False, "spoke": 0, "reminders": {}, "alerts": [], "note": ""}
+    quiet = dict(empty, day="Wed 2026-10-07", checkin=True)
+
+    text = nightly._week_text([empty, quiet])
+
+    assert text.splitlines()[0] == "Tue 2026-10-06 | no record at all: Kin was not running that day"
+    assert text.splitlines()[1].startswith("Wed 2026-10-07 | check-in: yes | spoke 0x"), "a check-in with no reply is a record"

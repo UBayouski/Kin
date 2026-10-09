@@ -4,6 +4,7 @@ Runs locally today; this is the function the nightly Nebius Serverless Job will 
 Only one day's log is sent to the model, never the whole memory.
 """
 
+import re
 from datetime import date, datetime
 
 from kin import config, llm
@@ -34,6 +35,8 @@ lines are the microphone failing, never evidence about the person: leave them ou
 clearly they spoke, on confusion, forgetfulness or repetition. If little was understood, say the day was
 quiet. Judge nothing about their mind or mood beyond what they plainly said.
 Do not invent anything. Do not mention the log, the robot's tools, or these instructions.
+If the events show you could not reach your robot for an hour or more, say so plainly in one line and make
+clear it says nothing about her: a silent day because you were offline is not a quiet day.
 """
 
 
@@ -60,10 +63,26 @@ def status(memory: Memory, day: date | None = None) -> str:
     return "\n".join(lines)
 
 
+def blind_for(memory: Memory, day: date) -> int:
+    """Minutes that day Kin reported being unable to reach the robot. Read from his own alerts, so it
+    survives a restart. Only the longest stretch is taken; the alerts repeat as an outage goes on."""
+    minutes = [int(m.group(1)) for _, kind, detail in memory.events_on(day) if kind == "robot_down"
+               for m in [re.search(r"for (\d+) minutes", detail)] if m]
+    return max(minutes, default=0)
+
+
 def build(memory: Memory, day: date | None = None) -> str:
     day = day or datetime.now().date()
     turns, reminders, events = memory.turns_on(day), memory.reminder_history(day), memory.events_on(day)
     if not turns and not reminders:
+        # "A quiet day" would be a false reassurance when the truth is that Kin could not see her at all:
+        # on Sep 30 the robot was unreachable for 20 hours and the family got no note whatsoever.
+        blind = blind_for(memory, day)
+        if blind >= 60:
+            return (f"Kin's note for {day:%A %d %B}\n\nI could not reach my robot for about "
+                    f"{blind // 60} hour(s) today, so I have nothing to tell you about how "
+                    f"{config.person_name() or 'she'} has been. This is a fault at my end, not a sign "
+                    "about her. It may be worth a call, and the robot may need restarting.")
         return f"Kin's note for {day:%A %d %B}: a quiet day. No conversations or reminders were recorded."
 
     prompt = PROMPT.format(

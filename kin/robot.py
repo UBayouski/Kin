@@ -82,12 +82,35 @@ def hold_idle(robot: anki_vector.Robot) -> bool:
     """Between tasks, keep the light hold that stops Vector's idle behaviours (see config.idle_hold).
     Returns whether the robot answered the request. A dropped link releases every hold, and a request
     made while the link is still shaky can go unanswered: live, he wandered off the dock in the gap."""
-    if not config.idle_hold():
+    if not config.idle_hold() or busy_being_himself():
         return False
     held = _answered(robot, lambda: robot.conn.request_control(
         behavior_control_level=ControlPriorityLevel.RESERVE_CONTROL, timeout=10))
     robot.kin_idle_held = held  # the SDK records the level as soon as it is asked for, answered or not
     return held
+
+
+_his_own_time_until = 0.0  # while this is in the future, Vector is left entirely to himself
+
+
+def let_him_be(seconds: float) -> None:
+    """Hand Vector back for a while so one of his own behaviours can run to the end. Kin takes no control
+    and starts no task meanwhile: a fetch takes longer than a minute, and control cut it short (Sep 23)."""
+    global _his_own_time_until
+    _his_own_time_until = max(_his_own_time_until, time.monotonic() + seconds)
+
+
+def busy_being_himself() -> bool:
+    return time.monotonic() < _his_own_time_until
+
+
+def hand_back(robot: anki_vector.Robot) -> None:
+    """Release whatever control Kin holds, right now, mid-task if need be."""
+    try:
+        robot.conn.release_control(timeout=10)
+    except Exception:
+        pass
+    robot.kin_idle_held = False
 
 
 def drop_hold(robot: anki_vector.Robot) -> None:

@@ -40,12 +40,21 @@ One line per day: check-in done, how many times they spoke to Kin, reminder outc
 short note the family received that day:
 {week}
 
-Write a short weekly note in plain text, under 110 words:
-- Only patterns supported by at least two days of data: reminders repeatedly missed or declined (say which \
-and when), days with little or no contact, a worry or ache mentioned on several days, anything improving.
-- Compare the start of the week with the end where it is meaningful.
+Write a short weekly note in plain text, under 110 words, warm and matter-of-fact. It is about {person}, \
+not about the robot:
+- Lead with how the week went for them, using only what they said themselves: plans, visitors, worries, \
+aches, anything they mentioned on several days.
+- Reminders repeatedly missed or declined (say which and when), and anything improving.
+- Days with little or no contact: say so plainly, but only for days the robot was working. A day when Kin \
+could not reach his robot, or has no record at all, says nothing about them.
+- Only patterns supported by at least two days of data. Compare the start of the week with the end where \
+it is meaningful.
+- Robot trouble (offline, restarts, battery) gets at most one short sentence at the very end, or nothing.
 - If there is too little history for any pattern, say exactly that in one sentence and stop.
-Rules: report, never diagnose or interpret health. Do not invent. Do not mention this prompt or the data format.
+Rules: never diagnose or interpret health; report their words ("said her knee aches"), not conclusions. \
+What they said was written down by an imperfect microphone: never remark on how clearly they spoke, on \
+confusion, forgetfulness or repetition. Judge nothing about their mind or mood beyond what they plainly \
+said. Do not invent. Do not mention this prompt or the data format.
 """
 
 SELF_CHECK_PROMPT = """\
@@ -67,6 +76,11 @@ Find places where Kin broke a rule:
 - nagging: pressed, scolded or repeated a reminder after the person declined
 - ignored: the person asked something and Kin did not respond to it
 - secrecy: messaged the family without telling the person, or hid that the family is told things
+- belittling: spoke to her as though she were a child - "we" about something that is hers alone ("shall we \
+take our pills", "how lovely we look"), baby talk, singsong, "dear", "sweetie", "good girl", or praise \
+for ordinary things as though she had achieved something
+- her_body: passed on a guess about her body, health or mood as if it were observed ("you look tired", \
+"you seem confused", "you sound unwell") - the camera and the microphone cannot know any of that
 
 Reply with JSON only: {{"issues": [{{"rule": "...", "quote": "Kin's exact words", "severity": "low" or "high", \
 "why": "one short sentence"}}]}}. Severity is high when the person could act on it to their harm or be let \
@@ -122,6 +136,10 @@ def _ask(prompt: str, max_tokens: int = 8000) -> str:  # a reasoning model spend
 def _week_text(week: list[dict]) -> str:
     lines = []
     for d in week:
+        if not (d["checkin"] or d["spoke"] or d["reminders"] or d["alerts"] or d["note"]):
+            # Oct 6 and 7: the hub was off, and the model read the empty days as the person being silent.
+            lines.append(f"{d['day']} | no record at all: Kin was not running that day")
+            continue
         reminders = "; ".join(f"{text}: {outcome}" for text, outcome in d["reminders"].items()) or "none"
         alerts = "; ".join(d["alerts"]) or "none"
         lines.append(

@@ -40,6 +40,8 @@ def play(names: list[str]) -> None:
     from piper import PiperVoice, SynthesisConfig
     from piper.download_voices import download_voice
 
+    from kin.voice import device_id, with_tail
+
     synthesis = SynthesisConfig(length_scale=config.speech_slowdown())
     line = SAMPLE.format(person=config.person_name() or "there")
     numbered = names == ["all"]
@@ -60,9 +62,9 @@ def play(names: list[str]) -> None:
         intro = f"Number {number}. {spoken_name}." if numbered else f"This is {spoken_name}."
         chunks = list(voice.synthesize(f"{intro} {line}", syn_config=synthesis))
         took = time.perf_counter() - started
-        audio = np.concatenate([c.audio_int16_array for c in chunks])
+        audio = with_tail(np.concatenate([c.audio_int16_array for c in chunks]), chunks[0].sample_rate)
         print(f"{number:>2}  {short:11} {name:36} synthesized in {took:.2f} s", flush=True)
-        sd.play(audio, samplerate=chunks[0].sample_rate, device=config.audio_output_device())
+        sd.play(audio, samplerate=chunks[0].sample_rate, device=device_id(config.audio_output_device(), "output"))
         sd.wait()
         time.sleep(0.6)
 

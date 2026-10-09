@@ -92,6 +92,50 @@ def unlink() -> dict:
     return before
 
 
+# --- asking Vector to do one of his own tricks -------------------------------------------------------------------------
+
+# Behaviours Vector owns. wire-pod's own control page fires these, so the names are its, not guesses.
+# Kin needs them because his microphone mangles the words: "fetch the cube" has come through as "french
+# cube", "fitch ya que" and "britain your view" (Sep 23), and the request then reached Kin, who had no way
+# to do it. Now he can hand it back to the robot the person actually asked.
+TRICKS = {
+    "fetch_cube": "intent_imperative_fetchcube",
+    "dance": "intent_imperative_dance",
+    "fist_bump": "intent_play_fistbump",
+    "take_photo": "intent_photo_take_extend",
+    "go_to_charger": "intent_system_charger",
+    "go_to_sleep": "intent_system_sleep",
+    "explore": "explore_start",
+}
+
+
+def robot_serial() -> str:
+    """Which robot to send an intent to: `VECTOR_SERIAL` when it is set, otherwise the one wire-pod knows.
+
+    Pin it once a second robot has ever been paired. wire-pod keeps every bot it has seen, and the SDK
+    picks one by itself when no serial is given, so with two in the list either could answer -- including
+    the dead one."""
+    pinned = config.vector_serial()
+    robots = httpx.get(f"{config.wirepod_url()}/api-sdk/get_sdk_info", timeout=10).json().get("robots") or []
+    known = [r.get("esn", "") for r in robots if r.get("esn")]
+    if pinned:
+        return pinned if pinned in known or not known else pinned
+    if len(known) > 1:
+        raise RuntimeError(f"wire-pod knows {len(known)} robots {known}; set VECTOR_SERIAL in .env")
+    return known[0] if known else ""
+
+
+def run_intent(intent: str) -> bool:
+    """Ask wire-pod to give the robot one of his own intents. Kin must not be holding behaviour control,
+    or the behaviour cannot run; the caller hands him back first (see `tools._tool_vector_trick`)."""
+    serial = robot_serial()
+    if not serial:
+        return False
+    response = httpx.post(f"{config.wirepod_url()}/api-sdk/cloud_intent",
+                          params={"intent": intent, "serial": serial}, timeout=15)
+    return response.is_success and "error" not in response.text.lower()
+
+
 # --- taking over built-in commands whose own answer is broken -----------------------------------------------------------
 
 # Asking Vector about the weather gets his built-in "weather API is not set up", while Kin has a real

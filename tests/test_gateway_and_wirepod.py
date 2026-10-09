@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 import httpx
@@ -419,3 +420,120 @@ def test_a_hold_refused_for_five_minutes_forces_a_reconnect(memory, family, monk
     battery.battery_volts += 0.001
     with pytest.raises(RuntimeError, match="refused for 5 minutes"):
         kin._heartbeat(robot)
+
+
+def desk(memory, family, monkeypatch):
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    kin.memory, kin.family, kin._delayed = memory, family, set()
+    monkeypatch.setenv("KIN_DIGEST_TIME", "23:59")  # not due during the test
+    return kin, service
+
+
+def test_the_family_still_gets_answers_while_the_robot_is_out_of_reach(memory, family, monkeypatch):
+    """Sep 30: the robot was unreachable for 20 hours, and because all of this lived inside his connection
+    the family got no evening note and no answer even to /status."""
+    kin, service = desk(memory, family, monkeypatch)
+    memory.inbox_add(1, 55, "Mila", "/status")
+    memory.inbox_add(2, 55, "Mila", "Tell mum I'll call at six")
+
+    kin._answer_family_questions(robot_reachable=False)
+
+    assert len(family.sent) == 2
+    assert "Today" in family.sent[0], "/status answered from memory, no robot involved"
+    assert "cannot reach my robot" in family.sent[1], "and the message to deliver is acknowledged, not ignored"
+    assert memory.inbox_next()[0] == 2, "it stays queued, in order, for delivery later"
+
+    kin._answer_family_questions(robot_reachable=False)
+    assert len(family.sent) == 2, "the sender is told once, not every reconnect"
+
+
+def test_with_the_robot_reachable_a_message_is_left_for_the_voice_path(memory, family, monkeypatch):
+    kin, service = desk(memory, family, monkeypatch)
+    memory.inbox_add(1, 55, "Mila", "/help")
+    memory.inbox_add(2, 55, "Mila", "Tell mum I'll call at six")
+
+    kin._answer_family_questions(robot_reachable=True)
+
+    assert len(family.sent) == 1 and "I'm Kin" in family.sent[0]
+    assert memory.inbox_next()[0] == 2 and not kin._delayed
+
+
+def test_a_day_kin_was_blind_is_not_reported_as_a_quiet_day(memory):
+    """"A quiet day" would be a false reassurance when the truth is that he could not see her at all."""
+    from datetime import date
+
+    from kin import digest
+
+    assert "a quiet day" in digest.build(memory, date.today())
+
+    memory.log_event("robot_down", "I have not been able to reach the robot for 768 minutes. Reminders ...")
+    note = digest.build(memory, date.today())
+
+    assert "could not reach my robot" in note and "12 hour(s)" in note
+    assert "quiet day" not in note
+    assert "not a sign" in note, "and it says plainly that it is a fault at Kin's end"
+
+
+def test_a_garbled_trick_request_is_handed_back_to_vectors_own_body(memory, monkeypatch):
+    """His microphone turns "fetch the cube" into "french cube" (Sep 23) and the request reached Kin, who
+    had no way to do it. wire-pod's own control page fires these intents, so Kin can too."""
+    from types import SimpleNamespace
+
+    from kin import robot as kin_robot
+    from kin import tools, wirepod
+    from kin.tools import RobotTools
+
+    asked, released = [], []
+    monkeypatch.setattr(wirepod, "run_intent", lambda intent: asked.append(intent) or True)
+    monkeypatch.setattr(kin_robot, "hand_back", lambda robot: released.append(True))
+    robot = SimpleNamespace(conn=SimpleNamespace(release_control=lambda timeout=0: None))
+    kit = RobotTools(robot, memory)
+
+    assert "vector_trick" in [spec["function"]["name"] for spec in tools.tool_specs()]
+    result = kit.dispatch("vector_trick", json.dumps({"trick": "fetch_cube"}))
+
+    assert asked == ["intent_imperative_fetchcube"], "the intent wire-pod's own UI uses"
+    assert released == [True], "Kin lets go of control, or the behaviour cannot run"
+    assert "doing it himself" in result
+    assert kin_robot.busy_being_himself(), "and he is left alone while it runs"
+
+    assert kit.dispatch("vector_trick", json.dumps({"trick": "backflip"})).startswith("error:")
+    assert asked == ["intent_imperative_fetchcube"]
+
+
+def test_while_he_is_doing_his_own_trick_kin_starts_no_task(memory, monkeypatch):
+    from types import SimpleNamespace
+
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    monkeypatch.setattr(service.kin_robot, "busy_being_himself", lambda: True)
+    for quiet in ("_watch_movement", "_heartbeat", "_let_him_react", "desk_work"):
+        monkeypatch.setattr(kin, quiet, lambda *a, **k: None, raising=False)
+    kin._touch = SimpleNamespace(petted=lambda: pytest.fail("a task must not start mid-trick"))
+
+    assert kin.tick(None, None) is False
+
+
+def test_which_robot_to_talk_to_is_pinned_once_there_are_two(monkeypatch):
+    """A second robot is being bought (Oct 3). wire-pod keeps every bot it has paired and the SDK picks one
+    by itself, so without a pinned serial an intent could go to the dead one."""
+    from kin import wirepod
+
+    monkeypatch.delenv("VECTOR_SERIAL", raising=False)  # the real .env pins one; this test is about the unpinned case
+
+    class Reply:
+        def __init__(self, esns): self._esns = esns
+        def json(self): return {"robots": [{"esn": e} for e in self._esns]}
+
+    monkeypatch.setattr(wirepod.httpx, "get", lambda *a, **k: Reply(["0dd19176"]))
+    assert wirepod.robot_serial() == "0dd19176", "one robot needs no setting"
+
+    monkeypatch.setattr(wirepod.httpx, "get", lambda *a, **k: Reply(["0dd19176", "00e20abc"]))
+    with pytest.raises(RuntimeError, match="set VECTOR_SERIAL"):
+        wirepod.robot_serial()
+
+    monkeypatch.setenv("VECTOR_SERIAL", "00e20abc")
+    assert wirepod.robot_serial() == "00e20abc"

@@ -25,6 +25,24 @@ def report_absence(memory: Memory, family: Family | None) -> str | None:
     return alert
 
 
+def report_deaf(memory: Memory, family: Family | None) -> str | None:
+    """Tell the family, once a day, that Kin's microphone is giving him nothing, so he cannot say whether
+    the person is about. Raised instead of an absence alert: "I have not seen or heard her today" drawn
+    from a broken ear is a false claim about someone's wellbeing (Oct 3, the input device had become a
+    webcam that delivers silence)."""
+    today = datetime.now().date()
+    if any(kind == "deaf" for _, kind, _ in memory.events_on(today)):
+        return None
+    alert = (f"My microphone is not picking anything up, so I cannot tell whether {_person()} is about. "
+             "This is a fault at my end and says nothing about her. The microphone may be unplugged, muted "
+             "or switched for another device.")
+    memory.log_event("deaf", alert)
+    memory.log_event("alert", alert)
+    if family:
+        family.send(f"Kin: {alert}")
+    return alert
+
+
 def report_all_clear(memory: Memory, family: Family | None) -> str | None:
     """After an absence alert, tell the family as soon as the person turns up. Once per day."""
     today = datetime.now().date()

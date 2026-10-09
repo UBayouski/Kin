@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from kin.agent import Agent, speakable, thinking_continues
+from kin.agent import SIGNED_OFF, Agent, sign_off, speakable, thinking_continues
 
 
 class StubMouth:
@@ -111,16 +111,65 @@ def test_anything_else_met_by_silence_ends_the_conversation_quietly(memory):
     assert waits == [True, False, False]
 
 
-def test_a_no_to_anything_else_gets_a_short_spoken_sign_off(memory):
+def test_a_no_to_anything_else_gets_the_same_sign_off_whatever_the_planner_writes(memory):
+    """Oct 8, 11:28: "No, I'm good." was answered with "Checked in with Jennie, she's good.", read out to her.
+    Oct 3, 18:00: "Reminder handled, ..." was filtered out and she heard nothing. The sign-off is Kin's own."""
     agent, mouth, _ = make_agent(memory, [
         reply(tool_call("say", text="Take a light jacket.")),
         reply(tool_call("ask", question="Anything else?")),
-        reply(content="Okay, I'm here if you need me."),
+        reply(content="Checked in with Jennie, she's good."),
     ], ears=["No, thank you."])
 
     agent.run("should I take a jacket?")
 
-    assert mouth.said[-1] == "Okay, I'm here if you need me."
+    assert mouth.said == ["Take a light jacket.", "Anything else?", sign_off()]
+    assert [who for _, who, _ in memory.recent_turns()][-2:] == ["person", "kin"]
+
+
+def test_nothing_more_is_said_after_the_sign_off(memory):
+    agent, mouth, _ = make_agent(memory, [
+        reply(tool_call("ask", question="It's 66 and clear. Do you need anything else?")),
+        reply(tool_call("say", text="Alright, take care!")),  # a second goodbye of the planner's own
+        reply(content="Gave the weather; she needed nothing else."),
+    ], ears=["Now I'm good."])  # Whisper's "No" often comes out as "Now"
+
+    agent.run("What's the weather?")
+
+    assert mouth.said == ["It's 66 and clear. Do you need anything else?", sign_off()]
+    tool_results = [m["content"] for m in agent.messages if m["role"] == "tool"]
+    assert "You have signed off" in tool_results[0] and tool_results[1] == SIGNED_OFF
+
+
+def test_a_no_to_a_question_that_is_not_an_offer_of_more_does_not_end_the_conversation(memory):
+    agent, mouth, _ = make_agent(memory, [
+        reply(tool_call("ask", question="Did you take your pills?")),
+        reply(tool_call("ask", question="Shall I remind you again in ten minutes?")),
+        reply(content="Alright, I'll leave you to it."),
+    ], ears=["No.", "No, I'll take them now."])
+
+    agent.run("[Reminder #1 is due: 'pills'.]", speaker="system")
+
+    assert mouth.said == ["Did you take your pills?", "Shall I remind you again in ten minutes?",
+                          "Alright, I'll leave you to it."]
+
+
+def test_a_no_with_a_request_in_it_carries_on(memory):
+    agent, mouth, _ = make_agent(memory, [
+        reply(tool_call("ask", question="Do you need anything else?")),
+        reply(tool_call("ask", question="It's 66 and clear. Anything else?")),
+        reply(content="Gave the weather."),
+    ], ears=["No, but what's the weather?", "No, thank you."])
+
+    agent.run("Hello")
+
+    assert mouth.said == ["Do you need anything else?", "It's 66 and clear. Anything else?", sign_off()]
+
+
+def test_the_sign_off_wishes_the_rest_of_the_day():
+    assert sign_off(9).endswith("Have a lovely day.")
+    assert sign_off(15).endswith("Enjoy your afternoon.")
+    assert sign_off(19).endswith("Have a lovely evening.")
+    assert all(sign_off(hour).startswith("Okay, I'm here if you need me.") for hour in range(24))
 
 
 def test_system_triggers_are_not_logged_as_something_the_person_said(memory):
@@ -285,3 +334,57 @@ def test_a_reply_to_a_spoken_closing_question_carries_the_conversation_on(memory
                           "Okay, I'm here if you need me."]
     assert [text for _, who, text in memory.recent_turns() if who == "person"] == \
         ["tell me the weather", "Yes, one more thing.", "Nothing, never mind."]
+
+
+def test_a_reply_is_answered_even_when_bookkeeping_came_after_it(memory):
+    """Sep 29, 18:00: "did you drink your water?" - "Yes, I do." - Kin logged the outcome and finished
+    without a word, because `reminder_outcome` counts as nobody waiting. She had just answered him."""
+    agent, mouth, _ = make_agent(memory, [
+        reply(tool_call("ask", question="Jennie, did you remember to drink your water today?")),
+        reply(tool_call("reminder_outcome", reminder_id=1, outcome="confirmed")),
+        reply(content="Lovely, well done. Do you need anything else?"),
+        reply(content="Reminder handled, Jennie confirmed drinking water."),  # Oct 3: this met her "No, thank you"
+    ], ears=["Yes, I do.", "No thanks."])
+    memory.add_reminder("drink water", "18:00")
+    agent.tools.current_reminder = 1
+
+    agent.run("[Reminder #1 is due: 'drink water'.]", speaker="system")
+
+    assert mouth.said == ["Jennie, did you remember to drink your water today?",
+                          "Lovely, well done. Do you need anything else?", sign_off()]
+
+
+def test_a_note_to_himself_after_his_own_words_is_still_not_spoken(memory):
+    agent, mouth, _ = make_agent(memory, [
+        reply(tool_call("say", text="Take a light jacket.")),
+        reply(tool_call("remember", fact="She is going out.")),
+        reply(content="Told her about the jacket and noted the outing."),
+    ])
+
+    agent.run("should I take a jacket?")
+
+    assert mouth.said == ["Take a light jacket."], "he spoke last, so his closing note stays private"
+
+
+@pytest.mark.parametrize("closing, spoken", [
+    # Oct 2, after the water reminder: Kin answered her properly and then read out his own log line.
+    ("Jennie drank water and said she does not need anything else.", ""),
+    ("Jennie confirmed she had her water.", ""),
+    ("The person declined the reminder.", ""),
+    ("Jennie seemed tired this morning.", ""),
+    # Oct 8, right after "No, I'm good": a subjectless log line, and her name followed by "she"
+    ("Checked in with Jennie, she's good.", ""),
+    ("Reminded her about the water; no reply.", ""),
+    ("Set the reminder for 8 pm.", ""),
+    # direct address and ordinary speech are untouched
+    ("Jennie, have a lovely day.", "Jennie, have a lovely day."),
+    ("Okay Jennie, I'm here if you need me.", "Okay Jennie, I'm here if you need me."),
+    ("Lovely, well done.", "Lovely, well done."),
+    ("Mila said she will call at six.", "Mila said she will call at six."),
+    ("Jennie, your daughter says she will visit on Sunday.", "Jennie, your daughter says she will visit on Sunday."),
+    ("Settled, then. I'm here if you need me.", "Settled, then. I'm here if you need me."),
+])
+def test_a_third_person_report_about_her_is_never_said_to_her(closing, spoken, monkeypatch):
+    monkeypatch.setenv("KIN_PERSON_NAME", "Jennie")
+
+    assert speakable(closing) == spoken
