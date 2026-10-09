@@ -1,0 +1,27 @@
+# Kin as a systemd *user* service on the Linux hub. A user unit, not a system one, because the hub's
+# sound server (PipeWire) runs per user and PortAudio must find it: a user unit gets the right runtime
+# directory for free. With lingering on ("loginctl enable-linger kin") it starts at boot with nobody
+# logged in and survives SSH sessions ending, which is everything the Windows logon task could not do.
+#
+#   mkdir -p ~/.config/systemd/user && cp scripts/linux/kin.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now kin
+#   journalctl --user -u kin -f          # the log
+#   systemctl --user restart kin         # after a git pull
+#
+# wire-pod is a system service (sudo systemctl status wire-pod); Kin reconnects by itself if it comes up later.
+
+[Unit]
+Description=Kin companion service
+After=network-online.target pipewire-pulse.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/Vector
+ExecStart=%h/Vector/.venv/bin/python -u -m kin.service
+Restart=always
+RestartSec=15
+# .env is the single source of truth for settings; nothing is overridden here.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

@@ -126,6 +126,34 @@ def test_a_no_to_anything_else_gets_the_same_sign_off_whatever_the_planner_write
     assert [who for _, who, _ in memory.recent_turns()][-2:] == ["person", "kin"]
 
 
+def test_a_quiet_no_to_anything_else_is_still_a_no(memory):
+    """Oct 9, first evening on the Linux hub: "Anything else?" got a quiet "no" (three seconds of voice at a
+    third of her usual level, no words found in it) and Kin ended without a word, as if nobody were there."""
+    agent, mouth, _ = make_agent(memory, [
+        reply(tool_call("say", text="Take a light jacket.")),
+        reply(tool_call("ask", question="Anything else?")),
+        reply(content="Checked in with Jennie, she's good."),
+    ], ears=[])
+    agent.tools.ears.heard_voice = True  # what the ears report after a capture with no words in it
+
+    agent.run("should I take a jacket?")
+
+    assert mouth.said == ["Take a light jacket.", "Anything else?", sign_off()]
+    assert [who for _, who, _ in memory.recent_turns()][-1] == "kin", "nothing is put in her mouth"
+
+
+def test_a_voice_with_no_words_is_not_a_no_to_an_ordinary_question(memory):
+    agent, mouth, _ = make_agent(memory, [
+        reply(tool_call("ask", question="How did you sleep?")),
+        reply(content="No answer to the question."),
+    ], ears=[])
+    agent.tools.ears.heard_voice = True
+
+    agent.run("[check-in]", speaker="system")
+
+    assert mouth.said == ["How did you sleep?"], "an unclear answer to a real question is left to the planner"
+
+
 def test_nothing_more_is_said_after_the_sign_off(memory):
     agent, mouth, _ = make_agent(memory, [
         reply(tool_call("ask", question="It's 66 and clear. Do you need anything else?")),

@@ -77,6 +77,39 @@ def with_tail(audio: np.ndarray, sample_rate: int, seconds: float = 0.3) -> np.n
     return np.concatenate([audio, np.zeros(int(sample_rate * seconds), dtype=audio.dtype)])
 
 
+def resample(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    """Linear interpolation; plenty for speech on the way to a speaker."""
+    if source_rate == target_rate or len(audio) == 0:
+        return audio
+    count = int(round(len(audio) * target_rate / source_rate))
+    positions = np.linspace(0, len(audio) - 1, count)
+    return np.interp(positions, np.arange(len(audio)), audio.astype(np.float32)).astype(audio.dtype)
+
+
+def playback_rate(sd, device: int | None, wanted: int) -> int:
+    """The rate to play at: the voice's own when the device takes it, else one the device does take.
+
+    Windows resamples behind the scenes, so any rate works there. ALSA's raw hardware device does not:
+    the Jabra speakerphone takes 16 or 48 kHz and refused Piper's 22050 Hz outright (Oct 9, first run
+    on the Linux hub), so every sentence failed with 'Invalid sample rate'.
+    """
+    # Higher rates first: the Jabra also "accepts" 16 kHz and then runs it at 48 kHz, so 2.6 s of speech
+    # went by in 0.9 s as a cartoon voice. Going up is resampling; going down trusts the device too much.
+    candidates = [wanted, 48000, 44100]
+    try:
+        candidates.append(int(sd.query_devices(device, "output")["default_samplerate"]))
+    except Exception:
+        pass
+    candidates.append(16000)
+    for rate in candidates:
+        try:
+            sd.check_output_settings(device=device, samplerate=rate)
+            return rate
+        except Exception:
+            continue
+    return wanted  # let the real error surface
+
+
 class HubMouth:
     """Piper text-to-speech through the hub's speaker, with Vector moving as if the words were his.
 
@@ -110,8 +143,10 @@ class HubMouth:
         audio = with_tail(np.concatenate([c.audio_int16_array for c in chunks]), chunks[0].sample_rate)
         print(f"  (voice ready in {time.perf_counter() - started:.1f}s, "
               f"{len(audio) / chunks[0].sample_rate:.1f}s to say)", flush=True)
+        device = device_id(config.audio_output_device(), "output")
+        rate = playback_rate(sd, device, chunks[0].sample_rate)
         with self._talking():
-            sd.play(audio, samplerate=chunks[0].sample_rate, device=device_id(config.audio_output_device(), "output"))
+            sd.play(resample(audio, chunks[0].sample_rate, rate), samplerate=rate, device=device)
             sd.wait()
 
     def _talking(self):
@@ -149,6 +184,7 @@ class HubEars:
         self._noise_floor: float | None = None
         self._loudest = 1.0        # the loudest level of the last listen that heard nothing
         self._dead_listens = 0     # how many in a row were not merely quiet but silent (see `seems_deaf`)
+        self.heard_voice = False   # the last listen caught a voice but no words in it (see `listen`)
 
     def seems_deaf(self) -> bool:
         """Is the microphone giving us nothing at all?
@@ -275,6 +311,7 @@ class HubEars:
             self._skip_speaker_tail()
         self._noise_floor = None  # measured afresh each time; what the room was like an hour ago is no guide
         self._loudest = 1.0
+        self.heard_voice = False
         try:
             deadline = time.monotonic() + timeout
             while (remaining := deadline - time.monotonic()) > 0.5:
@@ -297,6 +334,10 @@ class HubEars:
                 if text:
                     self._dead_listens = 0
                     return text
+                if len(audio) >= LISTEN_RATE * 0.3:
+                    # Someone (or something) spoke and no words came out of it. `ask` tells the two apart for
+                    # a closing offer: a quiet "no" to "Anything else?" is not an empty room (Oct 9).
+                    self.heard_voice = True
             return None
         finally:
             self._release()

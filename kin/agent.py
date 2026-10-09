@@ -14,7 +14,7 @@ from kin import config, family, llm, search
 from kin import robot as kin_robot
 from kin.family import Family
 from kin.memory import Memory
-from kin.tools import NO_REPLY, REPLIED, RobotTools, is_closing_offer, is_decline, tool_specs
+from kin.tools import NO_REPLY, REPLIED, UNCLEAR_NO, RobotTools, is_closing_offer, is_decline, tool_specs
 from kin.voice import Ears, Mouth
 
 MAX_STEPS = 24  # a check-in is a conversation: several ask/remember rounds
@@ -419,6 +419,9 @@ class Agent:
         every time, and the planner is told. Any other reply is handed back as it is."""
         if not (is_closing_offer(question) and is_decline(result[len(REPLIED):])):
             return result
+        return self._sign_off_after(result)
+
+    def _sign_off_after(self, result: str) -> str:
         words = sign_off()
         self._log("  (they said no to more; signing off)")
         self.tools.dispatch("say", json.dumps({"text": words}))
@@ -471,6 +474,8 @@ class Agent:
                     result = self.tools.dispatch(call.function.name, call.function.arguments)
                     if result.startswith(REPLIED):
                         result = self._after_reply(_spoken_text(call.function.arguments), result)
+                    elif result == UNCLEAR_NO:  # a voice with no words, answering an offer of more
+                        result = self._sign_off_after(result)
                 self._log(f"  <- {result}")
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
                 # Nobody answered, so nobody is waiting: "Anything else?" met by silence ends the conversation
@@ -478,7 +483,7 @@ class Agent:
                 # Judged by the result, not the tool's name: a `say` that ended in a question listens too.
                 if result == NO_REPLY:
                     last_tool, self._she_spoke_last = "ask (unanswered)", False
-                elif result == SIGNED_OFF or self._signed_off and result.startswith(REPLIED):
+                elif result == SIGNED_OFF or self._signed_off and result.startswith((REPLIED, UNCLEAR_NO)):
                     last_tool, self._she_spoke_last = "say", False  # Kin had the last word, with the sign-off
                 elif result.startswith(REPLIED):
                     last_tool, engaged, self._she_spoke_last = "ask", True, True

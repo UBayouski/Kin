@@ -18,6 +18,7 @@ MAX_DRIVE_MM = 150
 MAX_TURN_DEG = 180
 HEAD_UP_DEG = 35
 NO_REPLY = "no reply heard"  # what `ask` returns when nobody answered
+UNCLEAR_NO = "someone answered, too quietly to make out the words"  # ... to an offer of more: taken as a no
 TRICK_SECONDS = 90  # how long Vector is left to himself after being asked for one of his own behaviours
 REPLIED = "the person replied: "  # and how its result begins when somebody did
 # With the reason: a bare "please put me on my charger" from a fully charged robot sounded like a fault.
@@ -324,6 +325,10 @@ class RobotTools:
         with kin_robot.animating(self.robot, "VC_ListeningLoop"):  # his own "I'm listening" look
             reply = self.ears.listen(timeout=seconds)
         if not reply or is_echo(question, reply):
+            # Oct 9: "Anything else?" got a quiet "no" (three seconds of voice at a third of her usual level,
+            # no words found in it) and Kin ended without a word, as if nobody were there.
+            if is_closing_offer(question) and getattr(self.ears, "heard_voice", False):
+                return UNCLEAR_NO
             return NO_REPLY
         self.memory.log_turn("person", reply)
         return REPLIED + reply

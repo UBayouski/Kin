@@ -178,3 +178,55 @@ def test_hub_speech_ends_with_a_little_silence():
     assert padded.dtype == np.int16
     assert len(padded) == 1000 + int(22050 * 0.3)
     assert padded[:1000].tolist() == audio.tolist() and not padded[1000:].any()
+
+
+def test_speech_is_resampled_to_a_rate_the_speaker_takes():
+    """Oct 9, first run on the Linux hub: the Jabra takes 16 or 48 kHz through ALSA and refused Piper's
+    22050 Hz, so every sentence failed. Windows had been resampling silently."""
+    import numpy as np
+
+    from kin import voice
+
+    class Speaker:
+        def query_devices(self, device, kind):
+            return {"default_samplerate": 48000.0}
+
+        def check_output_settings(self, device, samplerate):
+            if samplerate not in (16000, 48000):
+                raise ValueError("Invalid sample rate")
+
+    assert voice.playback_rate(Speaker(), 6, 22050) == 48000
+
+    class LyingSpeaker(Speaker):
+        """The real Jabra: reports 16 kHz as its default and accepts it, then plays it at 48 kHz."""
+        def query_devices(self, device, kind):
+            return {"default_samplerate": 16000.0}
+
+    assert voice.playback_rate(LyingSpeaker(), 6, 22050) == 48000, "a higher accepted rate beats the device's default"
+
+    class AnySpeaker(Speaker):
+        def check_output_settings(self, device, samplerate):
+            pass
+
+    assert voice.playback_rate(AnySpeaker(), 6, 22050) == 22050, "a device that takes the voice's rate gets it unchanged"
+
+    tone = np.full(22050, 1000, dtype=np.int16)  # one second of a constant signal
+    out = voice.resample(tone, 22050, 48000)
+    assert len(out) == 48000 and out.dtype == np.int16
+    assert int(out.min()) == 1000 and int(out.max()) == 1000, "resampling must not change the signal's level"
+    assert voice.resample(tone, 22050, 22050) is tone
+
+
+def test_the_ears_remember_a_voice_they_could_not_make_out():
+    ears = make_ears(captures=[seconds_of_sound(3)] * 50, transcripts=[""] * 50)
+    assert ears.listen(timeout=2) is None
+    assert ears.heard_voice is True, "someone spoke; `ask` treats that as a quiet no to an offer of more"
+
+    silent = make_ears(captures=[None], transcripts=[])
+    silent._loudest = 0.01
+    assert silent.listen(timeout=2) is None
+    assert silent.heard_voice is False
+
+    answered = make_ears(captures=[seconds_of_sound(2)], transcripts=["Yes."])
+    assert answered.listen(timeout=2) == "Yes."
+    assert answered.heard_voice is False
