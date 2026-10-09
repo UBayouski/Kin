@@ -537,3 +537,21 @@ def test_which_robot_to_talk_to_is_pinned_once_there_are_two(monkeypatch):
 
     monkeypatch.setenv("VECTOR_SERIAL", "00e20abc")
     assert wirepod.robot_serial() == "00e20abc"
+
+
+def test_the_checkin_carries_todays_weather_so_nothing_is_looked_up_mid_conversation(monkeypatch):
+    """Oct 9, 22:29 on the Linux hub: after "Yes, I'm here" the planner fetched the weather and did a recall
+    before greeting her, eight seconds of silence. The weather now travels in the note itself."""
+    from kin import service
+
+    prompt = service.checkin_prompt("San Jose. Now: 74 degrees Fahrenheit, clear sky.", " Stay on the charger.")
+    assert prompt.startswith("[Daily check-in.") and prompt.endswith(" Stay on the charger.]")
+    assert "Today's weather, already looked up: San Jose. Now: 74 degrees Fahrenheit, clear sky." in prompt
+    assert "`weather` tool" not in prompt, "the note no longer sends him to the tool"
+
+    assert "already looked up" not in service.checkin_prompt("", ""), "no weather, no claim of one"
+
+    monkeypatch.setattr(service.weather, "report", lambda place="": (_ for _ in ()).throw(ConnectionError("offline")))
+    assert service.Service._todays_weather() == "", "a failed fetch leaves the tool as the fallback, quietly"
+    monkeypatch.setattr(service.weather, "report", lambda place="": "Now: 60 degrees.")
+    assert service.Service._todays_weather() == "Now: 60 degrees."

@@ -252,10 +252,14 @@ class Agent:
             lines.append(f"The person you live with is {config.person_name()}. Use their name, also when writing to family.")
         if config.home_location():
             lines.append(f"The person lives in {config.home_location()}.")
-        facts = self.memory.active_facts(limit=15)
+        facts = self.memory.active_facts(limit=16)
         if facts:
             lines.append("\nFacts you have saved (newest first, # is the id for `update_fact`):")
-            lines += [f"- {fact.render()}" for fact in facts]
+            lines += [f"- {fact.render()}" for fact in facts[:15]]
+            # Oct 9: with seven facts, all of them in this list, he still ran `recall` after her hello and
+            # kept her waiting. He only needs to search when the list left something out.
+            lines.append("That is every fact you have saved; `recall` would find nothing more."
+                         if len(facts) <= 15 else "There are older facts than these; `recall` finds them.")
         with_vector = [(ts, detail) for ts, kind, detail in self.memory.events_on(datetime.now().date())
                        if kind == "vector_intent"][-6:]
         if with_vector:
@@ -471,11 +475,16 @@ class Agent:
                 if self._signed_off and call.function.name in ("say", "ask"):
                     result = SIGNED_OFF  # the goodbye has been said; a second one, or a new question, is not
                 else:
+                    started = time.perf_counter()
                     result = self.tools.dispatch(call.function.name, call.function.arguments)
+                    taken = time.perf_counter() - started
                     if result.startswith(REPLIED):
                         result = self._after_reply(_spoken_text(call.function.arguments), result)
                     elif result == UNCLEAR_NO:  # a voice with no words, answering an offer of more
                         result = self._sign_off_after(result)
+                    # Lookups are silent, so their cost is invisible in the log; the person hears it as a pause.
+                    if call.function.name in SILENT_STEPS and taken >= 0.3:
+                        self._log(f"  ({call.function.name} took {taken:.1f}s)")
                 self._log(f"  <- {result}")
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
                 # Nobody answered, so nobody is waiting: "Anything else?" met by silence ends the conversation

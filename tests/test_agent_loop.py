@@ -416,3 +416,18 @@ def test_a_third_person_report_about_her_is_never_said_to_her(closing, spoken, m
     monkeypatch.setenv("KIN_PERSON_NAME", "Jennie")
 
     assert speakable(closing) == spoken
+
+
+def test_the_planner_is_told_when_the_fact_list_is_complete(memory):
+    """Oct 9: seven facts, all in the prompt, and he still ran `recall` after her hello, eight seconds of
+    silence with the weather call. He is now told whether there is anything left to search."""
+    for n in range(3):
+        memory.remember(f"Fact number {n}.")
+    agent, _, _ = make_agent(memory, [])
+    assert "That is every fact you have saved; `recall` would find nothing more." in agent._context()
+
+    for n in range(3, 20):
+        memory.remember(f"Fact number {n}.")
+    context = agent._context()
+    assert "There are older facts than these; `recall` finds them." in context
+    assert context.count("- #") == 15, "the list itself stays at fifteen"

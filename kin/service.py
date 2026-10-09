@@ -23,7 +23,7 @@ import traceback
 from datetime import datetime
 
 from kin import robot as kin_robot
-from kin import alerts, config, digest, family, gateway, nightly, voice, wirepod
+from kin import alerts, config, digest, family, gateway, nightly, voice, weather, wirepod
 from kin.agent import Agent
 from kin.memory import Memory, Reminder
 
@@ -35,15 +35,27 @@ HEARTBEAT_SECONDS = 30
 
 CHECKIN = (
     "[Daily check-in. Find the person and greet them warmly, by name if you know it, in a way that fits "
-    "the time of day. Ask how they are, and in the morning how they slept. Follow up on one thing from "
+    "the time of day. The moment they answer your call, greet them: no lookups first (Oct 9: a weather "
+    "call and a recall before the greeting left them eight seconds of silence after saying hello). "
+    "Ask how they are, and in the morning how they slept. Follow up on one thing from "
     "your facts: a recent event, a worry, a visitor. If an answer is vague, ask one gentle follow-up. "
     "Always respond to what they just told you before moving on: a reply that ignores their words sounds "
     "like you were not listening. Ask what they have planned today; when they tell you, say something "
-    "about it and work today's weather into that (`weather` tool, one sentence: going out means what to "
-    "wear; staying in, just what it is like outside). Save plans and anything else worth keeping. "
+    "about it and work today's weather into that (one sentence: going out means what to wear; staying in, "
+    "just what it is like outside; the weather is given at the end of this note, so there is nothing to "
+    "look up). Save plans and anything else worth keeping. "
     "Keep it to a few exchanges. Your remark about their plans and the weather is the last one: put the "
     "offer of more in the same `ask`, as always, and after their no, wish them a good day."
 )
+
+
+def checkin_prompt(todays_weather: str = "", tail: str = "") -> str:
+    """The check-in note with today's weather already in it, so the conversation has no lookup in the
+    middle of it (Oct 9: a weather call and a recall after her hello left eight seconds of silence)."""
+    given = f" Today's weather, already looked up: {todays_weather}" if todays_weather else ""
+    return CHECKIN + given + tail + "]"
+
+
 PRESENCE_CHECK = (
     "[You have not seen or heard the person yet today and it is getting late in the morning. Look for them, "
     "then call out once with `ask`, warmly, to check they are there. If they answer, have a short friendly "
@@ -139,6 +151,15 @@ class Service:
     def _done_today(self, kind: str) -> bool:
         last = self.memory.last_event_time(kind)
         return bool(last and last[:10] == datetime.now().date().isoformat())
+
+    @staticmethod
+    def _todays_weather() -> str:
+        """Fetched before he calls out. If it fails he still has the `weather` tool, as before."""
+        try:
+            return weather.report()
+        except Exception as e:
+            log(f"  (weather not fetched beforehand: {type(e).__name__}; the tool is still there)")
+            return ""
 
     def _checkin_due(self) -> bool:
         if self.checkin_now:
@@ -495,7 +516,7 @@ class Service:
         if self._checkin_due():
             self.checkin_now = False
             log("check-in")
-            summary = agent.run(CHECKIN + going_home() + "]", speaker="system")
+            summary = agent.run(checkin_prompt(self._todays_weather(), going_home()), speaker="system")
             self.memory.log_event("checkin", summary)
             log("done: " + summary)
             return True
