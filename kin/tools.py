@@ -240,6 +240,10 @@ _SAYS_NO = re.compile(r"\b(no|now|nope|nah|nothing|never mind|not (now|today|rea
                       r"(do not|don'?t) (need|think))\b", re.IGNORECASE)
 
 
+_REQUEST_WORDS = re.compile(r"\b(call|phone|remind|reminder|tell|ask|what|when|where|how|why|who|weather|can|could|would|"
+                            r"please|send|set|check|look|read|time|news|turn|play|message|help|need|want)\b")
+
+
 def is_decline(reply: str) -> bool:
     """Is this reply to an offer of more a plain no, and nothing else?"""
     text = reply.strip()
@@ -250,6 +254,11 @@ def is_decline(reply: str) -> bool:
     if len(text.split()) > 12:
         return False
     phrases = [p.strip() for p in re.split(r"[,.!;]+", text.lower()) if p.strip()]
+    # Whisper hears a short "no" as almost anything ("So much. That's it.", Oct 10, and she got silence): a
+    # leading fragment of one or two words with no request in it is let go, and the rest is judged.
+    if (len(phrases) >= 2 and len(phrases[0].split()) <= 2 and not _DECLINE_PHRASE.fullmatch(phrases[0])
+            and not _REQUEST_WORDS.search(phrases[0])):
+        phrases = phrases[1:]
     return bool(phrases) and all(_DECLINE_PHRASE.fullmatch(p) for p in phrases) and any(_SAYS_NO.search(p) for p in phrases)
 
 

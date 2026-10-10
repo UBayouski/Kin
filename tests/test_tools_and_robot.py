@@ -415,6 +415,8 @@ def test_a_friendlier_kin_still_invents_no_abilities():
     ("No.", True), ("No, thank you.", True), ("No, I'm good. Thank you.", True), ("No, that's it. Thank you.", True),
     ("Now I'm good", True),                   # Whisper's "No" often comes out as "Now"
     ("now. Thank you.", True), ("Now.", True),  # Oct 9: this one fell through and "Check-in completed." was said
+    ("So much. That's it.", True), ("Yes. That's it.", True),  # Oct 10: a misheard "no" in front of a clear decline
+    ("Yes. Call Tom.", False), ("Okay. What's the weather?", False),  # a short fragment with a request behind it is not one
     ("Anything else? No, thank you.", True),  # the microphone caught the tail of Kin's own question first
     ("Nothing, never mind.", True), ("Not today.", True), ("I don't think so.", True), ("I'm all set, thank you", True),
     ("Yes", False), ("Yes, one more thing.", False), ("No, but what's the weather?", False),

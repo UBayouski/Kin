@@ -441,3 +441,16 @@ def test_a_status_line_is_never_said_to_her(status):
     """Oct 9, on the Linux hub: "No, that is it" was followed by "Check-in complete" spoken aloud, a
     status message where a goodbye belonged."""
     assert speakable(status) == ""
+
+
+def test_she_is_never_left_in_silence_after_speaking(memory):
+    """Oct 10, 09:01: her "no, that's it" came through as something that is not a decline, the planner closed
+    with a status line that is rightly not said, and she heard nothing. The sign-off goes out instead."""
+    agent, mouth, _ = make_agent(memory, [
+        reply(tool_call("ask", question="Anything else you need?")),
+        reply(content="Check-in completed."),
+    ], ears=["Maybe later, Kin."])
+
+    agent.run("[check-in]", speaker="system")
+
+    assert mouth.said == ["Anything else you need?", sign_off()]

@@ -415,6 +415,14 @@ class Agent:
                 finally:
                     self._stop_thinking()
                 waiting = self._she_spoke_last or (bool(last_tool) and last_tool not in QUIET_AFTER)
+            # Oct 10, 09:01: "No, that's it" was heard as "So much. That's it.", which is not a decline, and
+            # the planner closed with "Check-in completed.", which is rightly not said. She had spoken last
+            # and heard nothing. Nobody who has just spoken is left in silence: the sign-off goes out.
+            if (self._she_spoke_last and not self._signed_off and not summary.startswith("stopped:")
+                    and not speakable(summary)):
+                self._log("  (she spoke last and the closing text is not for her; signing off)")
+                self.tools.dispatch("say", json.dumps({"text": sign_off()}))
+                self._signed_off = True
             self._let_thinking_close()
         self.memory.log_event("task", summary)
         return summary
