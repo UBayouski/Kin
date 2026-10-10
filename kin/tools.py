@@ -124,7 +124,8 @@ TOOL_SPECS = [
         "weather",
         "Current weather plus today's and tomorrow's forecast, from a forecast service. Always use this for "
         "weather, never `web_search` and never your own knowledge. Say the temperature with its unit. Tell the "
-        "person about now and today in one or two short sentences; tomorrow only if they asked about it.",
+        "person about now and today in one or two short sentences, always ending with the 'To wear' advice "
+        "from the result; tomorrow only if they asked about it.",
         {"place": {"type": "string", "description": "Town or city; leave empty for where the person lives"}},
     ),
     _spec(
@@ -302,7 +303,10 @@ class RobotTools:
         if self.robot.status.is_on_charger:
             call(self.robot.behavior.drive_off_charger)
 
-    def _tool_say(self, text: str) -> str:
+    def _tool_say(self, text: str = "", question: str = "") -> str:
+        text = text or question  # the planner mixes up the two tools' parameter names now and then (Oct 9)
+        if not text.strip():
+            return "error: nothing to say"
         # The planner keeps putting questions in `say` despite its instructions. Live, a check-in said "How
         # did you sleep?" and then asked it again with `ask`, and later said "How are you feeling today?" to
         # nobody listening. A question is a question: whatever tool it came through, he listens for the answer.
@@ -316,7 +320,10 @@ class RobotTools:
         self.mouth.say(text)
         self.memory.log_turn("kin", text)
 
-    def _tool_ask(self, question: str) -> str:
+    def _tool_ask(self, question: str = "", text: str = "") -> str:
+        question = question or text
+        if not question:
+            return "error: nothing to ask"
         if prepare := getattr(self.ears, "prepare", None):
             prepare()  # microphone open before he speaks, so a prompt answer is not clipped; `listen` closes it
         self._speak(question)

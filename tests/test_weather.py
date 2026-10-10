@@ -67,6 +67,7 @@ def test_now_comes_from_the_station_and_the_forecast_from_the_model(home, monkey
     assert text.startswith("San Jose, California, United States. Now: 73 degrees Fahrenheit, clear, wind 13 miles per hour (measured by a weather station 1 minutes ago).")
     assert "Today: fog, high 74, low 58 degrees Fahrenheit, 2 percent chance of rain." in text
     assert "Tomorrow: partly cloudy, high 71, low 54 degrees Fahrenheit, no rain expected." in text
+    assert text.endswith("To wear: light clothes, and a layer to take off, as mornings and evenings are much cooler.")
     assert weather._stations, "the station is remembered, so the next report is one request shorter"
 
 
@@ -85,3 +86,16 @@ def test_outside_the_us_or_with_the_station_down_the_model_still_answers(home, m
         raise ConnectionError("weather.gov is down")
     monkeypatch.setattr(weather.httpx, "get", broken)
     assert "Now: 74 degrees Fahrenheit" in weather.report(), "the station failing never costs the answer"
+
+
+@pytest.mark.parametrize("high, low, rain, wind, imperial, expected", [
+    (74, 58, 2, 8, True, "To wear: light clothes, and a layer to take off, as mornings and evenings are much cooler."),
+    (85, 65, 0, 5, True, "To wear: light clothes, and a hat if out in the sun."),
+    (64, 55, 60, 10, True, "To wear: a light jacket or cardigan, and an umbrella."),
+    (45, 30, 10, 25, True, "To wear: a warm coat, with a hat and gloves, and something that closes at the front, as it is windy."),
+    (12, 4, 40, 10, False, "To wear: a warm jacket, and an umbrella."),  # 12 C is 54 F
+])
+def test_the_clothing_line_follows_the_numbers(high, low, rain, wind, imperial, expected):
+    """Oct 9: a check-in gave the forecast and said nothing about clothes; the advice was up to the planner.
+    Now it is part of the forecast text, the same every time."""
+    assert weather.dressing(high, low, rain, wind, imperial) == expected

@@ -109,6 +109,35 @@ def _observed_now(latitude: float, longitude: float, imperial: bool) -> str | No
         return None
 
 
+# --- what to wear ---------------------------------------------------------------------------------------------------
+
+
+def dressing(high: float, low: float, rain_chance: float, wind: float, imperial: bool) -> str:
+    """One practical line for the day, from the forecast numbers. Pure, and the same every time, so the
+    advice is regular instead of left to the planner's mood (Oct 9: a check-in gave the forecast and no
+    word on clothes). Thresholds are in Fahrenheit and miles per hour; metric input is converted."""
+    if not imperial:
+        high, low, wind = high * 9 / 5 + 32, low * 9 / 5 + 32, wind / 1.609344
+    if high >= 80:
+        wear = "light clothes, and a hat if out in the sun"
+    elif high >= 70:
+        wear = "light clothes"
+    elif high >= 60:
+        wear = "a light jacket or cardigan"
+    elif high >= 50:
+        wear = "a warm jacket"
+    else:
+        wear = "a warm coat, with a hat and gloves"
+    parts = [wear]
+    if high >= 70 and low < 60:
+        parts.append("a layer to take off, as mornings and evenings are much cooler")
+    if wind >= 20:
+        parts.append("something that closes at the front, as it is windy")
+    if rain_chance >= 30:
+        parts.append("an umbrella")
+    return "To wear: " + ", and ".join(parts) + "."
+
+
 # --- the report -----------------------------------------------------------------------------------------------------
 
 
@@ -145,4 +174,6 @@ def report(place: str = "") -> str:
             f"low {daily['temperature_2m_min'][i]:.0f} {deg}, "
             f"{'no rain expected' if not rain else f'{rain:.0f} percent chance of rain'}."
         )
+    lines.append(dressing(daily["temperature_2m_max"][0], daily["temperature_2m_min"][0],
+                          daily["precipitation_probability_max"][0] or 0, now["wind_speed_10m"], imperial))
     return "\n".join(lines)

@@ -425,3 +425,18 @@ def test_a_plain_no_to_an_offer_of_more_is_a_decline_and_a_no_with_a_request_in_
     from kin.tools import is_decline
 
     assert is_decline(reply) is declined
+
+
+def test_say_and_ask_accept_each_others_parameter_name(memory):
+    """Oct 9: the planner called ask({"text": ...}), got a TypeError back and spent a round fixing it."""
+    from types import SimpleNamespace
+
+    kit = RobotTools(None, memory)
+    said = []
+    kit.mouth = SimpleNamespace(say=said.append)
+    kit.ears = SimpleNamespace(listen=lambda timeout=12.0: "Yes.")
+
+    assert kit.dispatch("ask", json.dumps({"text": "Anything else?"})).startswith("the person replied: Yes.")
+    assert kit.dispatch("say", json.dumps({"question": "Good evening."})) == "said"
+    assert said == ["Anything else?", "Good evening."]
+    assert kit.dispatch("ask", "{}") == "error: nothing to ask"
