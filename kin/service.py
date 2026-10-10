@@ -17,6 +17,7 @@ Triggers, checked about once a second:
 Between tasks Vector is left to his own personality; control is borrowed per task.
 """
 
+import re
 import sys
 import time
 import traceback
@@ -25,6 +26,7 @@ from datetime import datetime
 from kin import robot as kin_robot
 from kin import alerts, config, digest, family, gateway, nightly, voice, weather, wirepod
 from kin.agent import Agent
+from kin import memory as memory_module
 from kin.memory import Memory, Reminder
 
 NIGHTLY_AT = "03:00"
@@ -200,9 +202,33 @@ class Service:
             waited = (datetime.now() - datetime.fromisoformat(received_at)).total_seconds() / 60
             late = f" It arrived {waited:.0f} minutes ago; mention that it is from earlier." if waited > 10 else ""
             prompt = f"[Message from family member {sender}, to deliver in person: \"{text}\".{late}]"
+            started = memory_module._now()  # memory's own clock, so the turns of this task can be picked out
             log("done: " + agent.run(prompt, speaker="system"))
+            self._report_delivery(chat_id, text, started)
             return True
         return False
+
+    def _report_delivery(self, chat_id: int, text: str, started: str) -> None:
+        """Tell the sender what became of their message, from the record rather than from the planner.
+
+        Oct 9, 19:54: "Tell Jenni we love her!" was delivered, she said nothing back, and the planner skipped
+        its `notify_family` step, so the sender never learned it had arrived. The planner may still report
+        first; then this says nothing."""
+        turns = self.memory.turns_since(started)
+        if any(ts >= started and kind == "family_out" for ts, kind, _ in self.memory.events_on(datetime.now().date())):
+            return  # the planner reported already
+        wanted = {w for w in re.findall(r"[a-z']+", text.lower()) if len(w) >= 3}
+        said_at = next((i for i, (_, who, line) in enumerate(turns) if who == "kin" and wanted
+                        and len(wanted & set(re.findall(r"[a-z']+", line.lower()))) >= 0.6 * len(wanted)), None)
+        name = config.person_name() or "the person"
+        if said_at is None:
+            note = f"I could not deliver your message: {name} was not around. Please send it again later."
+        else:
+            reply = " ".join(line for _, who, line in turns[said_at + 1:] if who == "person").strip()
+            note = (f"I gave {name} your message at {datetime.now():%H:%M}. "
+                    + (f"Reply: \"{reply}\"" if reply else "No reply."))
+        self.family.send(f"Kin: {note}", chat_id=chat_id)
+        self.memory.log_event("family_out", note)
 
     def _presence(self, robot, agent: Agent) -> bool:
         """Keep track of whether the person has been around today. Returns whether the robot ran a task."""

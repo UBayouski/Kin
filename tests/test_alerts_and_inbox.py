@@ -104,3 +104,43 @@ def test_a_second_outage_on_the_same_day_is_reported_too(memory, family):
 def test_a_robot_stranded_with_a_low_battery_is_reported_once(memory, family):
     assert "off his charger with a low battery for 10 minutes" in alerts.report_stranded(memory, family, 10)
     assert alerts.report_stranded(memory, family, 20) is None
+
+def test_the_sender_is_told_what_became_of_their_message(memory, family):
+    """Oct 9, 19:54: "Tell Jenni we love her!" was delivered, she said nothing back, the planner skipped its
+    report step, and the sender never learned it had arrived. The service now reports from the record."""
+    from kin import service
+
+    kin = service.Service.__new__(service.Service)
+    kin.memory, kin.family = memory, family
+
+    class Agent:
+        def __init__(self, lines): self.lines = lines
+        def run(self, prompt, speaker="person", note=None):
+            for who, line in self.lines:
+                memory.log_turn(who, line)
+            return "done"
+
+    delivered_with_reply = Agent([("kin", "Jennie, are you there?"), ("person", "Yes."),
+                                  ("kin", 'Jennie, Vlad says: "Tell Jennie we love her!"'),
+                                  ("kin", "Would you like to send anything back?"), ("person", "Tell him I love him too.")])
+    kin._handle_family_message(delivered_with_reply, 42, "Vlad", "Tell Jenni we love her!", "2026-10-09T19:50:38")
+    assert family.sent[-1].startswith("Kin: I gave Jennie your message at ") or family.sent[-1].startswith("Kin: I gave the person your message at ")
+    assert family.sent[-1].endswith('Reply: "Tell him I love him too."')
+
+    delivered_no_reply = Agent([("kin", 'Jennie, Vlad says: "Tell Jennie we love her!"'), ("kin", "Anything to send back?")])
+    kin._handle_family_message(delivered_no_reply, 42, "Vlad", "Tell Jenni we love her!", "2026-10-09T19:50:38")
+    assert family.sent[-1].endswith("No reply.")
+
+    nobody_home = Agent([("kin", "Jennie, are you there?")])
+    kin._handle_family_message(nobody_home, 42, "Vlad", "Tell Jenni we love her!", "2026-10-09T19:50:38")
+    assert "could not deliver" in family.sent[-1] and "send it again later" in family.sent[-1]
+
+    class ReportingAgent(Agent):
+        def run(self, prompt, speaker="person", note=None):
+            super().run(prompt, speaker, note)
+            memory.log_event("family_out", "Delivered; she says hi back.")  # what `notify_family` records
+            family.send("Kin: Delivered; she says hi back.")
+            return "done"
+    before = len(family.sent)
+    kin._handle_family_message(ReportingAgent(delivered_no_reply.lines), 42, "Vlad", "Tell Jenni we love her!", "2026-10-09T19:50:38")
+    assert len(family.sent) == before + 1, "the planner reported itself, so the service does not report twice"

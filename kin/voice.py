@@ -10,6 +10,7 @@ Speech stays on the hub: neither Piper nor Whisper sends audio anywhere.
 
 import contextlib
 import queue
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -108,6 +109,41 @@ def playback_rate(sd, device: int | None, wanted: int) -> int:
         except Exception:
             continue
     return wanted  # let the real error surface
+
+
+# Whisper's stock inventions on near-silence or noise. "Thank you." alone is not here: it is a real reply.
+_GUESSES = {"thanks for watching", "thank you for watching", "subtitles by the amara.org community",
+            "i want you to know that i am a human being"}
+
+
+def words_in(segments) -> str:
+    """The transcript, or '' when Whisper was guessing rather than hearing.
+
+    Oct 9, a quiet evening on the Linux hub: a 3.5 s capture of near-silence came back as "I want you to
+    know that I am a human being", twice, and Kin thanked her for sharing it; an 11 s capture of room noise
+    took 47 s to decode into "yeah yeah yeah aye aye aye". Whisper marks both: a high no-speech probability
+    or a low average log-probability per segment, and a transcript that is one phrase on repeat.
+    """
+    kept = []
+    for segment in segments:
+        if getattr(segment, "no_speech_prob", 0.0) > 0.6 or getattr(segment, "avg_logprob", 0.0) < -1.0:
+            continue
+        if piece := segment.text.strip():
+            kept.append(piece)
+    text = " ".join(kept)
+    words = re.findall(r"[a-z']+", text.lower())
+    if not words or " ".join(words) in _GUESSES:
+        return ""
+    if len(words) >= 6:
+        from collections import Counter
+
+        commonest = sum(count for _, count in Counter(words).most_common(2))
+        if commonest >= 0.6 * len(words):
+            return ""  # "yeah yeah yeah aye aye aye": a decoder loop, not a sentence
+    sentences = [s.strip().lower() for s in re.split(r"[.!?]+", text) if s.strip()]
+    if len(sentences) >= 2 and len(set(sentences)) == 1 and len(sentences[0].split()) >= 4:
+        return ""  # the same sentence over and over is the other shape of the loop
+    return text
 
 
 class HubMouth:
@@ -326,8 +362,9 @@ class HubEars:
                 recorded = time.perf_counter()
                 text = ""
                 if len(audio) >= LISTEN_RATE * 0.3:
-                    segments, _ = self._model.transcribe(audio, language="en", vad_filter=True, beam_size=3)
-                    text = " ".join(s.text.strip() for s in segments).strip()
+                    segments, _ = self._model.transcribe(audio, language="en", vad_filter=True, beam_size=3,
+                                                         condition_on_previous_text=False)
+                    text = words_in(list(segments))
                 print(f"  (listened {recorded - started:.1f}s, of which {config.end_pause():.1f}s waiting to be sure "
                       f"they had finished; transcribed in {time.perf_counter() - recorded:.1f}s"
                       f"{'' if text else '; no words in it, still listening'})", flush=True)

@@ -230,3 +230,21 @@ def test_the_ears_remember_a_voice_they_could_not_make_out():
     answered = make_ears(captures=[seconds_of_sound(2)], transcripts=["Yes."])
     assert answered.listen(timeout=2) == "Yes."
     assert answered.heard_voice is False
+
+
+def test_whispers_guesses_on_noise_are_not_taken_for_words():
+    """Oct 9, a quiet evening: near-silence became "I want you to know that I am a human being" (twice) and
+    Kin thanked her for sharing; 11 s of room noise decoded, slowly, into "yeah yeah yeah aye aye aye"."""
+    from kin.voice import words_in
+
+    seg = lambda text, no_speech=0.0, logprob=-0.3: SimpleNamespace(text=text, no_speech_prob=no_speech, avg_logprob=logprob)
+
+    assert words_in([seg(" Yes, I did. ")]) == "Yes, I did."
+    assert words_in([seg("Thank you.")]) == "Thank you.", "a real short reply stays"
+    assert words_in([seg("I want you to know that I am a human being.", no_speech=0.1)]) == ""
+    assert words_in([seg("See ya Yeah yeah yeah yeah Aye aye aye aye aye gite Prize Aye aye aye")]) == ""
+    assert words_in([seg("Call my daughter please."), seg(" Call my daughter please.")]) == ""
+    assert words_in([seg("Not today, I think.", no_speech=0.9)]) == "", "Whisper itself says it was probably not speech"
+    assert words_in([seg("mumble mumble", logprob=-1.4)]) == "", "and here that it was guessing"
+    assert words_in([seg("Fine,", logprob=-0.2), seg("thanks.", no_speech=0.95)]) == "Fine,", "segments are judged one by one"
+    assert words_in([SimpleNamespace(text="Yes.")]) == "Yes.", "a segment without the scores (the tests' fake) passes through"
