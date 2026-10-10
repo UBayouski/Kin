@@ -264,3 +264,14 @@ def db_path() -> str:
 
 def vector_serial() -> str | None:
     return os.getenv("VECTOR_SERIAL", "").strip() or None
+
+
+def nightly_url() -> str:
+    """Where the night's thinking runs when not on the hub: the URL of `python -m kin.nightly --serve`
+    in a Nebius serverless container. Empty means the hub does it."""
+    return os.getenv("KIN_NIGHTLY_URL", "").strip()
+
+
+def nightly_token() -> str:
+    """The bearer token that service expects, if any."""
+    return os.getenv("KIN_NIGHTLY_TOKEN", "").strip()

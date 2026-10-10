@@ -181,3 +181,47 @@ def test_a_day_with_no_record_is_shown_as_kin_not_running():
 
     assert text.splitlines()[0] == "Tue 2026-10-06 | no record at all: Kin was not running that day"
     assert text.splitlines()[1].startswith("Wed 2026-10-07 | check-in: yes | spoke 0x"), "a check-in with no reply is a record"
+
+
+def test_the_night_can_be_served_over_http_and_called_from_the_hub(memory, monkeypatch):
+    """Oct 9: the night as a Nebius serverless container. The hub posts the payload and applies the answer;
+    the container needs no database, and a bad token or payload leaves it standing."""
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    import httpx
+
+    seen = {}
+    def fake_run(payload):
+        seen.update(payload)
+        return {"operations": [], "trends": "A good week.", "issues": [], "errors": []}
+    monkeypatch.setattr(nightly, "run", fake_run)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), nightly._handler("s3cret"))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/"
+    try:
+        assert httpx.get(url).json() == {"ok": True, "service": "kin-nightly"}
+        assert httpx.post(url, json={}).status_code == 401, "no token, no night"
+        assert httpx.post(url, content=b"not json", headers={"Authorization": "Bearer s3cret"}).status_code == 400
+
+        summary = nightly.run_remotely(memory, url, "s3cret")
+
+        assert "self-check found 0 issue(s)" in summary
+        assert seen["person"] and isinstance(seen["week"], list) and len(seen["week"]) == 7, "the real export went over"
+        assert nightly.latest_trends(memory) == "A good week."
+    finally:
+        server.shutdown()
+
+
+def test_when_the_cloud_night_fails_the_hub_does_it_and_says_so(memory, monkeypatch):
+    monkeypatch.setenv("KIN_NIGHTLY_URL", "http://127.0.0.1:9/")  # nothing listens there
+    monkeypatch.setattr(nightly, "run_locally", lambda m: "memory updated 0; self-check found 0 issue(s), 0 high")
+
+    summary = nightly.run_nightly(memory)
+
+    assert summary.endswith("(on the hub; the cloud service failed: ConnectError)")
+    errors = [d for _, k, d in memory.events_on(__import__("datetime").date.today()) if k == "nightly_error"]
+    assert len(errors) == 1 and errors[0].startswith("cloud: ConnectError")
+
+    monkeypatch.delenv("KIN_NIGHTLY_URL")
+    assert nightly.run_nightly(memory).endswith("(on the hub)")

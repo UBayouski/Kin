@@ -566,7 +566,7 @@ class Service:
         if datetime.now().strftime("%H:%M") >= NIGHTLY_AT and not self._done_today("nightly"):
             log("nightly reflection: memory, weekly trends, self-check")
             self.memory.log_event("nightly", "started")  # marked first, so a failure is not retried every tick
-            summary = nightly.run_locally(self.memory)
+            summary = nightly.run_nightly(self.memory)
             log("done: " + summary)
             for _, kind, detail in self.memory.events_on(datetime.now().date()):
                 if kind == "self_check" and detail.startswith("[high]"):

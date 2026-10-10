@@ -227,6 +227,88 @@ def run_locally(memory: Memory) -> str:
     return apply(memory, run(export(memory)))
 
 
+# --- the same thinking as a service in the cloud ------------------------------------------------------------------
+#
+# A Nebius serverless container runs `--serve`: the hub posts the payload at 03:00 and gets the result back in
+# the response. No job objects, no CLI on the hub, no log fetching. The container holds only the modules
+# above and Nebius credentials; the data still never leaves the hub except for the payload itself.
+
+REMOTE_TIMEOUT_SECONDS = 900  # the night takes one to six minutes, most of it Nemotron Ultra thinking
+
+
+def _handler(token: str):
+    """The request handler for `serve`, as a class so a test can stand the server up on a free port."""
+    from http.server import BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, status: int, body: dict) -> None:
+            data = json.dumps(body).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self) -> None:  # noqa: N802 - the server's name for it
+            self._send(200, {"ok": True, "service": "kin-nightly"})
+
+        def do_POST(self) -> None:  # noqa: N802
+            if token and self.headers.get("Authorization", "") != f"Bearer {token}":
+                self._send(401, {"error": "bad or missing bearer token"})
+                return
+            try:
+                payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                for key in ("today", "person", "facts", "conversation", "week"):
+                    payload.setdefault(key, [] if key == "week" else "")
+                result = run(payload)
+            except Exception as e:  # a bad payload is the caller's problem; the server stays up
+                self._send(400, {"error": f"{type(e).__name__}: {str(e)[:200]}"})
+                return
+            self._send(200, result)
+
+        def log_message(self, fmt: str, *args) -> None:
+            print(f"{datetime.now():%H:%M:%S} {fmt % args}", flush=True)
+
+    return Handler
+
+
+def serve(port: int = 8080, token: str = "") -> None:
+    """Serve the night over HTTP until stopped. `token`, when set, must come as a bearer token; the platform's
+    own token authentication can stand in front of it instead."""
+    from http.server import ThreadingHTTPServer
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), _handler(token))
+    print(f"kin-nightly serving on port {port}{' with a bearer token' if token else ''}", flush=True)
+    server.serve_forever()
+
+
+def run_remotely(memory: Memory, url: str, token: str = "") -> str:
+    """Export, post to the service, apply. Raises when the service cannot be reached or answers badly."""
+    import httpx
+
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    response = httpx.post(url, json=export(memory), headers=headers,
+                          timeout=httpx.Timeout(REMOTE_TIMEOUT_SECONDS, connect=30))
+    response.raise_for_status()
+    result = response.json()
+    if not isinstance(result, dict) or "operations" not in result:
+        raise ValueError(f"not a nightly result: {str(result)[:120]}")
+    return apply(memory, result)
+
+
+def run_nightly(memory: Memory) -> str:
+    """The night, in the cloud when `KIN_NIGHTLY_URL` is set and the hub otherwise. A cloud failure is
+    recorded as a `nightly_error` event and the hub does the work itself, so the night never goes missing."""
+    url = config.nightly_url()
+    if not url:
+        return run_locally(memory) + " (on the hub)"
+    try:
+        return run_remotely(memory, url, config.nightly_token()) + " (on Nebius)"
+    except Exception as e:
+        memory.log_event("nightly_error", f"cloud: {type(e).__name__}: {str(e)[:160]}; ran on the hub instead")
+        return run_locally(memory) + f" (on the hub; the cloud service failed: {type(e).__name__})"
+
+
 def latest_trends(memory: Memory) -> str:
     row = memory.db.execute("SELECT detail FROM events WHERE kind = 'trends' ORDER BY id DESC LIMIT 1").fetchone()
     return row[0] if row else "No weekly note yet; the first one is written overnight."
@@ -258,7 +340,9 @@ def run_from_env() -> None:
 
 
 def main(argv: list[str]) -> None:
-    if "--job" in argv:  # inside the container
+    if "--serve" in argv:  # inside a serverless container: the night as an HTTP service
+        serve(int(os.environ.get("PORT", "8080")), os.environ.get("KIN_NIGHTLY_TOKEN", ""))
+    elif "--job" in argv:  # inside a job container: payload in, result out through the log
         run_from_env()
     elif "--encode" in argv:  # hub side: print the payload in the form the job takes
         print(encode_payload(export(Memory())))
@@ -275,8 +359,8 @@ def main(argv: list[str]) -> None:
     elif "--apply" in argv:
         _, target = argv[argv.index("--apply") + 1:][:2]
         print(apply(Memory(), json.loads(Path(target).read_text("utf-8"))))
-    else:
-        print(run_locally(Memory()))
+    else:  # the night, now: in the cloud if KIN_NIGHTLY_URL is set, on the hub otherwise
+        print(run_nightly(Memory()))
 
 
 if __name__ == "__main__":
