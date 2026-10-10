@@ -5,13 +5,18 @@ were contradicted, and lifts lasting facts out of the day's conversation that we
 Runs locally today; the same function is what the nightly Nebius Serverless Job will call.
 """
 
+from __future__ import annotations
+
 import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from kin import config, llm
-from kin.memory import Memory
+
+if TYPE_CHECKING:  # only a type here: the night's container runs these modules without the database module
+    from kin.memory import Memory
 
 PROMPT = """\
 You maintain the long-term memory of Kin, a companion robot for an older adult who lives alone.

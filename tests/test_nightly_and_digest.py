@@ -225,3 +225,15 @@ def test_when_the_cloud_night_fails_the_hub_does_it_and_says_so(memory, monkeypa
 
     monkeypatch.delenv("KIN_NIGHTLY_URL")
     assert nightly.run_nightly(memory).endswith("(on the hub)")
+
+
+def test_the_container_modules_load_without_the_database_module(monkeypatch):
+    """The Nebius container gets five files, not six: memory.py (18 KiB) tipped the console form over its
+    size cap. The night's thinking never touches the database, so the modules must import without it."""
+    import importlib
+    import sys
+
+    monkeypatch.setitem(sys.modules, "kin.memory", None)  # makes `import kin.memory` fail
+    for name in ("kin.consolidate", "kin.nightly"):
+        importlib.reload(sys.modules[name])
+    assert nightly.run({"today": "x", "person": "p", "facts": "", "conversation": "", "week": []})["trends"].startswith("Not enough history")

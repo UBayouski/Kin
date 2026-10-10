@@ -20,6 +20,8 @@ What leaves the hub: the saved facts, the conversation since the last tidy-up, a
 reminder outcomes, counts and the short daily notes the family already receives. Not the full history.
 """
 
+from __future__ import annotations
+
 import base64
 import json
 import os
@@ -29,8 +31,12 @@ import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from typing import TYPE_CHECKING
+
 from kin import config, consolidate, llm
-from kin.memory import Memory
+
+if TYPE_CHECKING:  # only a type here: the container serving `--serve` has no database module
+    from kin.memory import Memory
 
 TRENDS_PROMPT = """\
 You look for patterns across one week in the life of {person}, an older adult who lives alone with Kin, a \
@@ -339,28 +345,34 @@ def run_from_env() -> None:
     print(f"{RESULT_BEGIN}\n{packed}\n{RESULT_END}", flush=True)
 
 
+def _memory() -> "Memory":
+    from kin.memory import Memory  # hub side only
+
+    return Memory()
+
+
 def main(argv: list[str]) -> None:
     if "--serve" in argv:  # inside a serverless container: the night as an HTTP service
         serve(int(os.environ.get("PORT", "8080")), os.environ.get("KIN_NIGHTLY_TOKEN", ""))
     elif "--job" in argv:  # inside a job container: payload in, result out through the log
         run_from_env()
     elif "--encode" in argv:  # hub side: print the payload in the form the job takes
-        print(encode_payload(export(Memory())))
+        print(encode_payload(export(_memory())))
     elif "--apply-log" in argv:  # hub side: apply a finished job's log
-        print(apply(Memory(), decode_result(Path(argv[argv.index("--apply-log") + 1]).read_text("utf-8-sig"))))
+        print(apply(_memory(), decode_result(Path(argv[argv.index("--apply-log") + 1]).read_text("utf-8-sig"))))
     elif "--run" in argv:  # the same thinking, file to file; no database access at all
         source, target = argv[argv.index("--run") + 1:][:2]
         Path(target).write_text(json.dumps(run(json.loads(Path(source).read_text("utf-8"))), indent=2), "utf-8")
         print(f"wrote {target}")
     elif "--export" in argv:
         target = argv[argv.index("--export") + 1]
-        Path(target).write_text(json.dumps(export(Memory()), indent=2), "utf-8")
+        Path(target).write_text(json.dumps(export(_memory()), indent=2), "utf-8")
         print(f"wrote {target}")
     elif "--apply" in argv:
         _, target = argv[argv.index("--apply") + 1:][:2]
-        print(apply(Memory(), json.loads(Path(target).read_text("utf-8"))))
+        print(apply(_memory(), json.loads(Path(target).read_text("utf-8"))))
     else:  # the night, now: in the cloud if KIN_NIGHTLY_URL is set, on the hub otherwise
-        print(run_nightly(Memory()))
+        print(run_nightly(_memory()))
 
 
 if __name__ == "__main__":
