@@ -22,6 +22,8 @@ Restart=always
 RestartSec=15
 # .env is the single source of truth for settings; nothing is overridden here.
 Environment=PYTHONUNBUFFERED=1
+# gRPC opens many sockets; the default 1024 was exhausted once by a leak (Oct 12). Headroom, not a cure.
+LimitNOFILE=16384
 
 [Install]
 WantedBy=default.target

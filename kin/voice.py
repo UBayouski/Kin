@@ -126,7 +126,12 @@ def words_in(segments) -> str:
     """
     kept = []
     for segment in segments:
-        if getattr(segment, "no_speech_prob", 0.0) > 0.6 or getattr(segment, "avg_logprob", 0.0) < -1.0:
+        no_speech, logprob = getattr(segment, "no_speech_prob", 0.0), getattr(segment, "avg_logprob", 0.0)
+        # Whisper's own rule: a segment is silence when it is probably not speech AND the decode was poor.
+        # Either alone is not enough: for 23 hours (Oct 10 to 11) an "or" here dropped every real reply,
+        # because this small CPU model's log-probability dips under -1.0 on ordinary short answers.
+        if no_speech > 0.6 and logprob < -1.0:
+            print(f"  (dropped as silence: {segment.text.strip()!r}, no-speech {no_speech:.2f}, log-prob {logprob:.2f})", flush=True)
             continue
         if piece := segment.text.strip():
             kept.append(piece)

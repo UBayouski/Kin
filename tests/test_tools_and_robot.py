@@ -442,3 +442,33 @@ def test_say_and_ask_accept_each_others_parameter_name(memory):
     assert kit.dispatch("say", json.dumps({"question": "Good evening."})) == "said"
     assert said == ["Anything else?", "Good evening."]
     assert kit.dispatch("ask", "{}") == "error: nothing to ask"
+
+
+def test_a_failed_connection_attempt_frees_its_channel(monkeypatch):
+    """Oct 11-12: the robot was flat for 15 hours and every 25 s retry kept its gRPC channel (threads and
+    sockets) until the process hit "Too many open files" and nothing worked any more, Whisper included."""
+    closed = []
+
+    class Channel:
+        def __init__(self):
+            self._channel = self
+
+        def close(self):
+            closed.append(True)
+
+    class Conn:
+        def __init__(self):
+            self._channel = Channel()
+
+    class FakeRobot:
+        def __init__(self, **kwargs):
+            self.conn = Conn()
+
+        def connect(self):
+            raise kin_robot.anki_vector.exceptions.VectorNotFoundException()
+
+    monkeypatch.setattr(kin_robot.anki_vector, "Robot", FakeRobot)
+    with pytest.raises(kin_robot.anki_vector.exceptions.VectorNotFoundException):
+        with kin_robot.connect(take_control=False):
+            pass
+    assert closed == [True]

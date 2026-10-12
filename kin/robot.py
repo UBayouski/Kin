@@ -32,6 +32,22 @@ def _disconnect_quietly(robot: anki_vector.Robot) -> None:
         pass
 
 
+def _abandon(robot: anki_vector.Robot) -> None:
+    """Free what a failed `connect` leaves behind: the gRPC channel, with its threads and sockets.
+
+    The SDK closes its event loop when the connection attempt fails but never the channel. With the robot
+    out of reach the service retries every 25 s, and each try kept its channel: 2,300 threads and every
+    file descriptor the process was allowed after 15 hours (Oct 11-12), at which point Whisper, the
+    database and the next connection attempt all failed with "Too many open files".
+    """
+    try:
+        inner = getattr(getattr(robot.conn, "_channel", None), "_channel", None)  # aiogrpc wraps a plain grpc channel
+        if inner is not None:
+            inner.close()
+    except Exception:
+        pass
+
+
 @contextmanager
 def connect(take_control: bool = True) -> Iterator[anki_vector.Robot]:
     """`with connect() as robot:`. Unlike the SDK's own context manager, a stalled disconnect cannot hang us.
@@ -42,7 +58,11 @@ def connect(take_control: bool = True) -> Iterator[anki_vector.Robot]:
     robot = anki_vector.Robot(
         serial=config.vector_serial(), enable_face_detection=True, behavior_control_level=level
     )
-    robot.connect()
+    try:
+        robot.connect()
+    except BaseException:
+        _abandon(robot)
+        raise
     try:
         yield robot
     finally:
