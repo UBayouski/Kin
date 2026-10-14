@@ -421,7 +421,9 @@ def test_a_friendlier_kin_still_invents_no_abilities():
     ("Nothing, never mind.", True), ("Not today.", True), ("I don't think so.", True), ("I'm all set, thank you", True),
     ("Yes", False), ("Yes, one more thing.", False), ("No, but what's the weather?", False),
     ("No, can you remind me at 8?", False), ("Not really, actually could you call my daughter", False),
-    ("Thank you.", False), ("No?", False), ("or november no, nelson", False), ("", False),
+    ("Thank you.", True), ("Thanks.", True), ("Thank you so much.", True),  # Oct 12: thanks alone after "anything else?" got silence
+    ("Thank you, could you call Tom?", False), ("Yes, thank you.", False),
+    ("No?", False), ("or november no, nelson", False), ("", False),
 ])
 def test_a_plain_no_to_an_offer_of_more_is_a_decline_and_a_no_with_a_request_in_it_is_not(reply, declined):
     from kin.tools import is_decline

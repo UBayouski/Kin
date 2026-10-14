@@ -230,7 +230,7 @@ def is_closing_offer(question: str) -> bool:
 # "That's it.", "Nothing, never mind." A decline is short and made only of such phrases; anything with a
 # request in it ("No, but what's the weather?") is not one, and the planner carries on as before.
 _NO_WORD = r"(?:no|nope|nah|now|not)\b\s*"
-_DECLINE_CLAUSE = (r"(?:thank you(?: very much)?|thanks|i'?m (?:good|fine|ok|okay|all right|alright|all set)|"
+_DECLINE_CLAUSE = (r"(?:thank you(?: (?:very|so) much)?|thanks(?: a lot)?|i'?m (?:good|fine|ok|okay|all right|alright|all set)|"
                    r"i am (?:good|fine|okay)|everything(?:'s| is) (?:fine|ok|okay|good)|"
                    r"that(?:'s| is| will be) (?:it|all|everything)|nothing(?: else| more| at all)?|never mind|"
                    r"not (?:now|today|right now|really)|all good|i (?:do not|don'?t) (?:need anything(?: else)?|think so)|no)")
@@ -238,6 +238,10 @@ _DECLINE_PHRASE = re.compile(rf"(?:{_NO_WORD})?(?:{_DECLINE_CLAUSE}\s*){{0,2}}",
 _SAYS_NO = re.compile(r"\b(no|now|nope|nah|nothing|never mind|not (now|today|really)|that('s| is| will be) (it|all|everything)|"
                       r"i('m| am) (good|fine|ok|okay|all right|alright|all set)|all good|everything('s| is) (fine|ok|okay|good)|"
                       r"(do not|don'?t) (need|think))\b", re.IGNORECASE)
+# "Do you need anything else?" "Thank you." is a no as well (Oct 12: it was handed to the planner as an open
+# reply, and he drove off to dock without a word). It is only ever judged after an offer of more, where thanks
+# alone cannot mean yes; if Whisper imagined the thanks out of silence, a sign-off is still the right end.
+_THANKS_ONLY = re.compile(r"\b(thank you|thanks)\b", re.IGNORECASE)
 
 
 _REQUEST_WORDS = re.compile(r"\b(call|phone|remind|reminder|tell|ask|what|when|where|how|why|who|weather|can|could|would|"
@@ -256,10 +260,17 @@ def is_decline(reply: str) -> bool:
     phrases = [p.strip() for p in re.split(r"[,.!;]+", text.lower()) if p.strip()]
     # Whisper hears a short "no" as almost anything ("So much. That's it.", Oct 10, and she got silence): a
     # leading fragment of one or two words with no request in it is let go, and the rest is judged.
+    dropped = False
     if (len(phrases) >= 2 and len(phrases[0].split()) <= 2 and not _DECLINE_PHRASE.fullmatch(phrases[0])
             and not _REQUEST_WORDS.search(phrases[0])):
-        phrases = phrases[1:]
-    return bool(phrases) and all(_DECLINE_PHRASE.fullmatch(p) for p in phrases) and any(_SAYS_NO.search(p) for p in phrases)
+        phrases, dropped = phrases[1:], True
+    if not phrases or not all(_DECLINE_PHRASE.fullmatch(p) for p in phrases):
+        return False
+    if any(_SAYS_NO.search(p) for p in phrases):
+        return True
+    # Thanks and nothing else is a no too, but only when nothing was dropped in front of it: "Yes, thank you."
+    # may well want something.
+    return not dropped and any(_THANKS_ONLY.search(p) for p in phrases)
 
 
 def is_echo(question: str, reply: str) -> bool:
