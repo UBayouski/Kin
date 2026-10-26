@@ -422,8 +422,14 @@ def test_a_friendlier_kin_still_invents_no_abilities():
     ("Yes", False), ("Yes, one more thing.", False), ("No, but what's the weather?", False),
     ("No, can you remind me at 8?", False), ("Not really, actually could you call my daughter", False),
     ("Thank you.", True), ("Thanks.", True), ("Thank you so much.", True),  # Oct 12: thanks alone after "anything else?" got silence
-    ("Thank you, could you call Tom?", False), ("Yes, thank you.", False),
-    ("No?", False), ("or november no, nelson", False), ("", False),
+    ("Thank you, could you call Tom?", False), ("Yes, thank you.", True),  # no request in it
+    ("No?", False), ("or november no, nelson", True), ("", False),  # noise with no request: goodbye
+    ("Thank you darling, that's it for today.", True),  # Oct 25: the check-in ended with no goodbye
+    ("No, that's all for now, dear.", True), ("Thanks love.", True),
+    ("Thank you darling, could you call Tom?", False),
+    ("Now, that's it. Thank you, darling. Have a wonderful rest of the day.", True),  # Oct 25, second take
+    ("No, bye now.", True), ("That's all, see you later.", True),
+    ("Have a nice day, and remind me at six.", False),
 ])
 def test_a_plain_no_to_an_offer_of_more_is_a_decline_and_a_no_with_a_request_in_it_is_not(reply, declined):
     from kin.tools import is_decline
@@ -474,3 +480,23 @@ def test_a_failed_connection_attempt_frees_its_channel(monkeypatch):
         with kin_robot.connect(take_control=False):
             pass
     assert closed == [True]
+
+
+def test_he_asks_to_be_put_on_his_charger_only_once_a_conversation(memory):
+    """Oct 16: "Could you please place me on my charger?" met silence, and the planner asked again in other
+    words, by its own "if no reply, ask once more" rule. The second request is refused."""
+    from types import SimpleNamespace
+
+    from kin.tools import LIFT_ASKED, NO_REPLY
+
+    spoken = []
+    kit = RobotTools(SimpleNamespace(anim=SimpleNamespace(play_animation_trigger=lambda *a, **k: None)),
+                     memory, mouth=SimpleNamespace(say=spoken.append), ears=SimpleNamespace(listen=lambda timeout=12.0: None))
+    assert kit.dispatch("ask", '{"question": "Could you please place me on my charger?"}') == NO_REPLY
+    assert kit.dispatch("ask", '{"question": "Would you mind putting me on my charger?"}') == LIFT_ASKED
+    assert kit.dispatch("say", '{"text": "Jennie, could you put me on the charger?"}') == LIFT_ASKED
+    assert kit.dispatch("ask", '{"question": "Are you there?"}') == NO_REPLY, "other questions are not affected"
+    assert spoken == ["Could you please place me on my charger?", "Are you there?"]
+
+    kit.asked_for_a_lift = False  # what `Agent.run` does at the start of every task
+    assert kit.dispatch("ask", '{"question": "Would you mind putting me on my charger?"}') == NO_REPLY

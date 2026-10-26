@@ -1,3 +1,4 @@
+import contextlib
 import json
 from datetime import datetime
 
@@ -143,15 +144,48 @@ def test_a_pet_is_just_a_pet_unless_pet_to_talk_is_on(memory, monkeypatch):
     assert "need anything else" in Agent._system_prompt(), "the closing offer is a rule for every conversation"
 
 
-def test_going_home_is_only_asked_for_when_kin_may_have_left_the_charger(monkeypatch):
+def test_after_a_task_that_left_the_charger_the_service_docks_him_and_asks_for_a_lift_once(memory, monkeypatch):
+    """Oct 16: the check-in told the planner to go home when finished. After "No, thank you so much!" it went to
+    dock instead of saying goodbye, could not see the charger, and asked her twice to carry him."""
+    from types import SimpleNamespace
+
     from kin import service
     from kin.memory import Reminder
-
-    reminder = Reminder(id=1, text="drink water", time_of_day="18:00", days="daily")
-    assert "go_home" not in service.reminder_prompt(reminder, 1)
+    from kin.tools import ASK_FOR_A_LIFT
 
     monkeypatch.setenv("KIN_STAY_ON_CHARGER", "off")
-    assert "go_home" in service.reminder_prompt(reminder, 1)
+    assert "go_home" not in service.reminder_prompt(Reminder(id=1, text="drink water", time_of_day="18:00", days="daily"), 1)
+    assert "go_home" not in service.checkin_prompt()
+
+    robot = SimpleNamespace(status=SimpleNamespace(is_on_charger=True))
+    calls = []
+
+    def dispatch(name, arguments):
+        calls.append((name, json.loads(arguments)))
+        return "cannot see the charger from here. " + ASK_FOR_A_LIFT if name == "go_home" else "said"
+
+    def task(*args):
+        robot.status.is_on_charger = False  # looking for her took him off it
+        return True
+
+    kin = service.Service.__new__(service.Service)
+    kin.memory = memory
+    monkeypatch.setattr(kin, "_tick", task)
+    monkeypatch.setattr(service.kin_robot, "control", lambda robot: contextlib.nullcontext())
+    agent = SimpleNamespace(tools=SimpleNamespace(dispatch=dispatch))
+
+    assert kin.tick(robot, agent) is True
+    assert calls == [("go_home", {}), ("say", {"text": service.LIFT_PLEA})]
+    assert not service.LIFT_PLEA.rstrip().endswith("?"), "a statement, so nobody is waited on"
+
+    calls.clear()
+    assert kin.tick(robot, agent) is True
+    assert calls == [], "he was already off the charger when the task began: that is for the quiet return home"
+
+    robot.status.is_on_charger = True
+    monkeypatch.setenv("KIN_STAY_ON_CHARGER", "on")
+    kin.tick(robot, agent)
+    assert calls == [], "staying on the charger, he never leaves it on a task"
 
 
 LOG = """\

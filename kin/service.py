@@ -17,6 +17,7 @@ Triggers, checked about once a second:
 Between tasks Vector is left to his own personality; control is borrowed per task.
 """
 
+import json
 import re
 import sys
 import time
@@ -28,6 +29,7 @@ from kin import alerts, config, digest, family, gateway, nightly, voice, weather
 from kin.agent import Agent
 from kin import memory as memory_module
 from kin.memory import Memory, Reminder
+from kin.tools import ASK_FOR_A_LIFT
 
 NIGHTLY_AT = "03:00"
 
@@ -77,6 +79,9 @@ GAUGE_UNREADABLE = (
     "Ask the person, once and politely, to put you on your charger to be safe. Do not mention your battery "
     "being low; you do not know. Thank them and finish.]"
 )
+# Said by the service after a task that left him off his charger and docking failed; never followed by a
+# second request. Not a question, so `say` does not wait for an answer that would go nowhere.
+LIFT_PLEA = "One more thing: could you put me back on my charger when you have a moment? I can't get there by myself."
 BODY_LOST_MINUTES = 5  # his body board silent this long, and the family is told
 HOLD_REFUSALS_BEFORE_RECONNECT = 10  # heartbeats (5 minutes) without the idle hold being granted: the link is bad
 OFF_DOCK_GRACE_SECONDS = 120     # off the charger this long with nothing to do, and he tries to get back
@@ -91,13 +96,6 @@ TOUCHED = (
 )
 
 
-def going_home() -> str:
-    """Added to a task's instructions only when Kin may have driven Vector off his charger. While he stays
-    on it there is nowhere to go back to; and if he is off it because he wandered or was lifted, docking
-    mostly fails and ends in a request to be carried. A low battery off the charger is handled on its own."""
-    return "" if config.stay_on_charger() else " When you are finished, go home with `go_home`."
-
-
 def reminder_prompt(reminder: Reminder, attempt: int) -> str:
     again = " This is another try; they did not answer earlier, so be gentle." if attempt > 1 else ""
     return (
@@ -107,9 +105,12 @@ def reminder_prompt(reminder: Reminder, attempt: int) -> str:
         "`reminder_outcome`: confirmed, declined, or no_response if you cannot find them or get no answer. "
         "If they answered, a few warm words back and the offer of more go in one `ask`, as always (\"Lovely, "
         "well done. Do you need anything else?\" / \"All right, another time. Anything else I can do?\"): "
-        "silence after their answer sounds like you did not hear them."
-        + going_home() + "]"
+        "silence after their answer sounds like you did not hear them.]"
     )
+
+
+def _on_charger(robot) -> bool:
+    return bool(getattr(getattr(robot, "status", None), "is_on_charger", False))
 
 
 def log(text: str) -> None:
@@ -269,11 +270,7 @@ class Service:
                     log(f"alert: {alert}")
             elif alert := alerts.report_absence(self.memory, self.family):
                 log(f"alert: {alert}")
-            # Only now the slow part. The family should not wait on a docking manoeuvre.
-            if not config.stay_on_charger():  # otherwise he looked and called from his charger and never left it
-                with kin_robot.control(robot):
-                    log("going home: " + agent.tools.dispatch("go_home", "{}"))
-            return True
+            return True  # docking, the slow part, comes after this returns: the family does not wait on it
 
         if clock >= config.presence_start() and now >= self._next_quiet_look:
             self._next_quiet_look = now + config.presence_look_minutes() * 60
@@ -430,8 +427,7 @@ class Service:
         note = (f"This request was heard through Vector's own microphone after the wake word or his back button, "
                 f"and he has already answered \"{ack}\" in his own voice. Do not greet or acknowledge again; go "
                 "straight to helping. His microphone is weak, so the words may be garbled: if they make no sense, "
-                "ask the person to say it again. From here on you hear them through a better microphone."
-                + going_home())
+                "ask the person to say it again. From here on you hear them through a better microphone.")
         log("done: " + agent.run(text, speaker="person", note=note))
         self.memory.heard_done(heard_id)
         self._forget_touch()  # a hand on his back during the request is not a new request
@@ -501,6 +497,27 @@ class Service:
 
     def tick(self, robot, agent: Agent) -> bool:
         """Run at most one task. Returns whether one ran."""
+        docked = _on_charger(robot)
+        ran = self._tick(robot, agent)
+        if ran and docked and not _on_charger(robot) and not config.stay_on_charger():
+            self._dock_after_task(robot, agent)
+        return ran
+
+    def _dock_after_task(self, robot, agent: Agent) -> None:
+        """A task took him off his charger (looking for her turns him off it when he may roam): back he goes.
+
+        Done here, after the conversation, rather than by the planner inside it. Oct 16: she said "No, thank
+        you so much!" to "Anything else?", the planner went to dock instead of saying goodbye, could not see
+        the charger, and asked her twice to carry him. Now the goodbye is the conversation's last word, and a
+        request for a lift is one fixed sentence, said once."""
+        with kin_robot.control(robot):
+            result = agent.tools.dispatch("go_home", "{}")
+            log(f"going home: {result}")
+            if result.endswith(ASK_FOR_A_LIFT):
+                agent.tools.dispatch("say", json.dumps({"text": LIFT_PLEA}))
+                self.memory.log_event("task", "could not get back onto the charger; asked to be put on it")
+
+    def _tick(self, robot, agent: Agent) -> bool:
         self._watch_movement(robot)
         self._heartbeat(robot)
         self._let_him_react(robot)
@@ -530,7 +547,7 @@ class Service:
                 return False  # a pet is just a pet: he purrs by himself. Talking starts with "Hey Vector" or his button
             agent.warm_up()
             self._acknowledge_touch(robot)
-            log("done: " + agent.run(TOUCHED + going_home() + "]", speaker="system"))
+            log("done: " + agent.run(TOUCHED + "]", speaker="system"))
             self._touch.discard()
             return True
 
@@ -543,7 +560,7 @@ class Service:
         if self._checkin_due():
             self.checkin_now = False
             log("check-in")
-            summary = agent.run(checkin_prompt(self._todays_weather(), going_home()), speaker="system")
+            summary = agent.run(checkin_prompt(self._todays_weather()), speaker="system")
             self.memory.log_event("checkin", summary)
             log("done: " + summary)
             return True

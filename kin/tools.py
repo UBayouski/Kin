@@ -24,6 +24,10 @@ REPLIED = "the person replied: "  # and how its result begins when somebody did
 # With the reason: a bare "please put me on my charger" from a fully charged robot sounded like a fault.
 ASK_FOR_A_LIFT = ("Ask the person, once and politely, to put you on it, and say why: you cannot get back to it "
                   "by yourself. Do not mention your battery unless it is low.")
+# Oct 16: after "cannot see the charger" he asked for a lift, heard nothing, and asked again in other words,
+# following the general "if no reply, ask once more" rule. Once is enforced here, not left to the prompt.
+LIFT_ASKED = ("not asked: you have already asked them once to put you on your charger in this conversation. "
+              "Do not ask again; finish.")
 
 # Friendly names the model may use, mapped to SDK animation triggers.
 ANIMATIONS = {
@@ -226,51 +230,28 @@ def is_closing_offer(question: str) -> bool:
     return bool(_CLOSING.search(question))
 
 
-# One phrase of a "no" to an offer of more: "No, thank you.", "Now I'm good" (Whisper's "No" is often "Now"),
-# "That's it.", "Nothing, never mind." A decline is short and made only of such phrases; anything with a
-# request in it ("No, but what's the weather?") is not one, and the planner carries on as before.
-_NO_WORD = r"(?:no|nope|nah|now|not)\b\s*"
-_DECLINE_CLAUSE = (r"(?:thank you(?: (?:very|so) much)?|thanks(?: a lot)?|i'?m (?:good|fine|ok|okay|all right|alright|all set)|"
-                   r"i am (?:good|fine|okay)|everything(?:'s| is) (?:fine|ok|okay|good)|"
-                   r"that(?:'s| is| will be) (?:it|all|everything)|nothing(?: else| more| at all)?|never mind|"
-                   r"not (?:now|today|right now|really)|all good|i (?:do not|don'?t) (?:need anything(?: else)?|think so)|no)")
-_DECLINE_PHRASE = re.compile(rf"(?:{_NO_WORD})?(?:{_DECLINE_CLAUSE}\s*){{0,2}}", re.IGNORECASE)
-_SAYS_NO = re.compile(r"\b(no|now|nope|nah|nothing|never mind|not (now|today|really)|that('s| is| will be) (it|all|everything)|"
-                      r"i('m| am) (good|fine|ok|okay|all right|alright|all set)|all good|everything('s| is) (fine|ok|okay|good)|"
-                      r"(do not|don'?t) (need|think))\b", re.IGNORECASE)
-# "Do you need anything else?" "Thank you." is a no as well (Oct 12: it was handed to the planner as an open
-# reply, and he drove off to dock without a word). It is only ever judged after an offer of more, where thanks
-# alone cannot mean yes; if Whisper imagined the thanks out of silence, a sign-off is still the right end.
-_THANKS_ONLY = re.compile(r"\b(thank you|thanks)\b", re.IGNORECASE)
-
-
+# After "Anything else?" there are only two answers: she wants something more, or she doesn't. How she says no
+# does not matter ("No, thank you", "That's it, darling", "Have a lovely day"); a list of ways to say it kept
+# missing new ones (Oct 25). So the test is for the other side: a question, a request, or a yes.
 _REQUEST_WORDS = re.compile(r"\b(call|phone|remind|reminder|tell|ask|what|when|where|how|why|who|weather|can|could|would|"
-                            r"please|send|set|check|look|read|time|news|turn|play|message|help|need|want)\b")
+                            r"please|send|set (?:a|an|up|me)|check|look|read|time|news|turn|play|message|help|need|want)\b")
+_MORE = re.compile(r"^(yes|yeah|yep|sure)$|\b(actually|also|one more|another thing|there is|there's)\b")
+# "I don't need anything" is a no, though it has "need" in it.
+_NOT_WANTED = re.compile(r"\b(do not|don'?t|doesn'?t|not)\s+(\w+\s+)?(need|want)\b")
+_LONG = 20  # a reply this long is her telling him something, and that is a conversation going on
 
 
 def is_decline(reply: str) -> bool:
-    """Is this reply to an offer of more a plain no, and nothing else?"""
+    """Is this reply to an offer of more anything other than a wish to carry on?"""
     text = reply.strip()
     if "?" in text:  # the microphone caught the tail of Kin's own question first: "Anything else? No, thank you."
         before, _, after = text.rpartition("?")
         if len(before.split()) >= 2:
             text = after
-    if len(text.split()) > 12:
+    text = _NOT_WANTED.sub(" ", text.lower()).strip(" .,!;")
+    if not text or len(text.split()) > _LONG:
         return False
-    phrases = [p.strip() for p in re.split(r"[,.!;]+", text.lower()) if p.strip()]
-    # Whisper hears a short "no" as almost anything ("So much. That's it.", Oct 10, and she got silence): a
-    # leading fragment of one or two words with no request in it is let go, and the rest is judged.
-    dropped = False
-    if (len(phrases) >= 2 and len(phrases[0].split()) <= 2 and not _DECLINE_PHRASE.fullmatch(phrases[0])
-            and not _REQUEST_WORDS.search(phrases[0])):
-        phrases, dropped = phrases[1:], True
-    if not phrases or not all(_DECLINE_PHRASE.fullmatch(p) for p in phrases):
-        return False
-    if any(_SAYS_NO.search(p) for p in phrases):
-        return True
-    # Thanks and nothing else is a no too, but only when nothing was dropped in front of it: "Yes, thank you."
-    # may well want something.
-    return not dropped and any(_THANKS_ONLY.search(p) for p in phrases)
+    return not ("?" in text or _REQUEST_WORDS.search(text) or _MORE.search(text))
 
 
 def is_echo(question: str, reply: str) -> bool:
@@ -297,6 +278,7 @@ class RobotTools:
         # docking attempt no longer makes him deaf to the person standing next to him.
         self.attention = attention
         self.current_reminder: int | None = None  # set by the service for the length of a reminder task
+        self.asked_for_a_lift = False  # per task (reset by `Agent.run`): has he asked to be put on his charger
         self.memory = memory
         self.family = family_link
         self.mouth = mouth or VectorMouth(robot)
@@ -344,6 +326,10 @@ class RobotTools:
         question = question or text
         if not question:
             return "error: nothing to ask"
+        lift = "charger" in question.lower()
+        if lift and self.asked_for_a_lift:
+            return LIFT_ASKED
+        self.asked_for_a_lift |= lift
         if prepare := getattr(self.ears, "prepare", None):
             prepare()  # microphone open before he speaks, so a prompt answer is not clipped; `listen` closes it
         self._speak(question)

@@ -98,17 +98,33 @@ def test_a_check_in_starts_without_a_thinking_show_and_a_question_in_say_is_list
     assert mouth.said == ["Good morning, Jennie! How did you sleep?", "Glad to hear it."]
 
 
-def test_anything_else_met_by_silence_ends_the_conversation_quietly(memory):
+def test_anything_else_met_by_silence_gets_the_sign_off_not_the_log_line(memory):
+    """Oct 24: after her answer, "Anything else?" met silence and he drove off without a word."""
     agent, mouth, waits = make_agent(memory, [
         reply(tool_call("say", text="Take a light jacket.")),
         reply(tool_call("ask", question="Anything else?")),
+        reply(tool_call("say", text="Bye now!")),  # refused: the goodbye has been said
         reply(content="Answered the jacket question; they had walked away."),
     ], ears=[])
 
     agent.run("should I take a jacket?")
 
-    assert mouth.said == ["Take a light jacket.", "Anything else?"], "the log line is not said to an empty room"
-    assert waits == [True, False, False]
+    assert mouth.said == ["Take a light jacket.", "Anything else?", sign_off()], "one goodbye, never the log line"
+    assert waits == [True, False, False, False]
+
+
+def test_a_reminder_nobody_answered_ends_without_a_goodbye_to_an_empty_room(memory):
+    agent, mouth, _ = make_agent(memory, [
+        reply(tool_call("ask", question="Jennie, have you taken your pills? Anything else I can do?")),
+        reply(tool_call("reminder_outcome", reminder_id=1, outcome="no_response")),
+        reply(content="Reminder logged, no response."),
+    ], ears=[])
+    memory.add_reminder("pills", "09:00")
+    agent.tools.current_reminder = 1
+
+    agent.run("[Reminder #1 is due: 'pills'.]", speaker="system")
+
+    assert mouth.said == ["Jennie, have you taken your pills? Anything else I can do?"]
 
 
 def test_a_no_to_anything_else_gets_the_same_sign_off_whatever_the_planner_writes(memory):

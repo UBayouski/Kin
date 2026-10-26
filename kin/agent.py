@@ -110,7 +110,7 @@ to time ("Anything else I can do for you?", "Is there anything else you need?"),
 - If they want something more, help, and offer again the same way. If they say no, the conversation is \
 over: your sign-off ("Okay, I'm here if you need me.") is said for you the moment they decline, so do \
 not say anything more; finish with a one-line private log entry. If no reply is heard, they have \
-walked away: do not ask again and do not `say` anything more, just finish.
+walked away: do not ask again and do not `say` anything more (any goodbye is said for you), just finish.
 - The one exception: when you are asking to be put on your charger, thank them and finish.
 
 Memory:
@@ -381,6 +381,7 @@ class Agent:
             self.memory.log_turn(speaker, user_text)
         self._she_spoke_last = speaker == "person"  # a request of her own is already waiting on an answer
         self._signed_off = False
+        self.tools.asked_for_a_lift = False
         turns_before = len(self.memory.turns_on(datetime.now().date()))
         with kin_robot.control(self.robot):
             try:
@@ -491,6 +492,11 @@ class Agent:
                         result = self._after_reply(_spoken_text(call.function.arguments), result)
                     elif result == UNCLEAR_NO:  # a voice with no words, answering an offer of more
                         result = self._sign_off_after(result)
+                    elif (result == NO_REPLY and engaged and not self._signed_off
+                          and is_closing_offer(_spoken_text(call.function.arguments))):
+                        # Oct 24: she had answered him, then "Anything else?" met silence and he drove off
+                        # without a word. Someone who was just talking to him gets the goodbye anyway.
+                        result = self._sign_off_after(result)
                     # Lookups are silent, so their cost is invisible in the log; the person hears it as a pause.
                     if call.function.name in SILENT_STEPS and taken >= 0.3:
                         self._log(f"  ({call.function.name} took {taken:.1f}s)")
@@ -499,7 +505,7 @@ class Agent:
                 # Nobody answered, so nobody is waiting: "Anything else?" met by silence ends the conversation
                 # quietly, and the closing text stays a private log line instead of being said to an empty room.
                 # Judged by the result, not the tool's name: a `say` that ended in a question listens too.
-                if result == NO_REPLY:
+                if result.startswith(NO_REPLY):
                     last_tool, self._she_spoke_last = "ask (unanswered)", False
                 elif result == SIGNED_OFF or self._signed_off and result.startswith((REPLIED, UNCLEAR_NO)):
                     last_tool, self._she_spoke_last = "say", False  # Kin had the last word, with the sign-off

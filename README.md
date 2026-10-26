@@ -42,7 +42,7 @@ You talk to him the way you talk to any Vector: say "Hey Vector" or press the bu
 
 **Private by design.** Speech recognition and the voice run offline on the hub, so no audio leaves the home. Camera frames are analysed and never stored. Memory is a local SQLite file. The family note is written from one day's log, not the whole history, and Kin tells the person what he shares.
 
-**Built to be left alone.** Every robot call has a deadline and can be cut short by a pet; a dropped link is noticed within 30 seconds and reconnected; family messages are saved before they are acknowledged, so a restart cannot lose one; each alert is sent exactly once. 75 tests run without a robot, a network or API keys.
+**Built to be left alone.** Every robot call has a deadline and can be cut short by a pet; a dropped link is noticed within 30 seconds and reconnected; family messages are saved before they are acknowledged, so a restart cannot lose one; each alert is sent exactly once. 233 tests run without a robot, a network or API keys.
 
 ## Setup
 
@@ -153,7 +153,7 @@ pip install -e ".[dev]"
 python -m pytest
 ```
 
-75 tests covering memory, reminders, family alerts, the durable inbox, the agent loop, listening, tool dispatch and the nightly reflection. They need no robot, network or API keys.
+233 tests covering memory, reminders, family alerts, the durable inbox, the agent loop, listening, tool dispatch, weather, the voice and the nightly reflection. They need no robot, network or API keys.
 
 ## License
 
