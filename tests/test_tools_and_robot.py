@@ -500,3 +500,21 @@ def test_he_asks_to_be_put_on_his_charger_only_once_a_conversation(memory):
 
     kit.asked_for_a_lift = False  # what `Agent.run` does at the start of every task
     assert kit.dispatch("ask", '{"question": "Would you mind putting me on my charger?"}') == NO_REPLY
+
+
+def test_an_echo_of_his_own_question_keeps_him_listening(memory):
+    """Oct 28: the microphone opened on the tail of "Have you taken them?" through the speaker, "taken them"
+    came back as the reply, and the reminder was logged as unanswered while she was drawing breath."""
+    from types import SimpleNamespace
+
+    from kin.tools import NO_REPLY
+
+    answers = iter(["taken them?", "Yes, I've just taken them."])
+    kit = RobotTools(SimpleNamespace(anim=SimpleNamespace(play_animation_trigger=lambda *a, **k: None)),
+                     memory, mouth=SimpleNamespace(say=lambda text: None),
+                     ears=SimpleNamespace(listen=lambda timeout=12.0: next(answers, None)))
+    assert kit.dispatch("ask", '{"question": "It is time for your pills. Have you taken them?"}') == \
+        "the person replied: Yes, I've just taken them."
+
+    answers = iter(["taken them?"])  # an echo and then silence is still no reply
+    assert kit.dispatch("ask", '{"question": "It is time for your pills. Have you taken them?"}') == NO_REPLY

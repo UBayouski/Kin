@@ -5,7 +5,7 @@ Only one day's log is sent to the model, never the whole memory.
 """
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from kin import config, llm
 from kin.memory import Memory
@@ -41,25 +41,53 @@ clear it says nothing about her: a silent day because you were offline is not a 
 
 
 def status(memory: Memory, day: date | None = None) -> str:
-    """A quick factual summary with no model call, for the /status command."""
-    day = day or datetime.now().date()
+    """A quick factual summary with no model call, for the /status command: facts and times, no reading of them."""
+    today = datetime.now().date()
+    day = day or today
+    person = config.person_name() or "she"
     turns = [t for t in memory.turns_on(day) if t[1] == "person"]
-    reminders = memory.reminder_history(day)
-    latest: dict[str, str] = {}  # the last recorded outcome per reminder is the one that counts
-    for _, text, outcome in reminders:
-        if outcome != "asked":
-            latest[text] = outcome.replace("_", " ")
-    settled = [f"{text}: {outcome}" for text, outcome in latest.items()]
-    alerts = [detail for _, kind, detail in memory.events_on(day) if kind == "alert"]
-    checkin = any(kind == "checkin" for _, kind, _ in memory.events_on(day))
+    events = memory.events_on(day)
+    # Every settled outcome with its time, runs of the same outcome collapsed to the last one: "confirmed 12:37,
+    # no response 13:10" tells the family more than the final word alone did.
+    outcomes: dict[str, list[tuple[str, str]]] = {}
+    for ts, text, outcome in sorted(memory.reminder_history(day)):  # by time, not by the order rows were written
+        if outcome == "asked" or not ts.startswith(day.isoformat()):
+            continue
+        run = outcomes.setdefault(text, [])
+        if run and run[-1][0] == outcome:
+            run[-1] = (outcome, ts[11:16])
+        else:
+            run.append((outcome, ts[11:16]))
+    settled = [f"{text}: " + ", ".join(f"{o.replace('_', ' ')} {at}" for o, at in run) for text, run in outcomes.items()]
+    checkins = [(ts, detail) for ts, kind, detail in events if kind == "checkin"]
+    answered = [ts for ts, detail in checkins if not re.search(r"no (response|reply)", detail, re.I)]
+    if answered:
+        checkin = f"done at {answered[-1][11:16]}"
+    elif checkins:
+        checkin = "tried at " + ", ".join(ts[11:16] for ts, _ in checkins) + ", no reply"
+    else:
+        checkin = "not yet" if day == today else "none"
+    family_in = sum(kind == "family_in" for _, kind, _ in events)
+    family_out = sum(kind == "family_out" for _, kind, _ in events)
+    alerts = [detail for _, kind, detail in events if kind == "alert" and "reach the robot" not in detail]
+    blind = blind_for(memory, day)
+    last = memory.last_sign_of_person(day)
+    label = "Today" if day == today else "Yesterday" if day == today - timedelta(days=1) else f"{day:%A}"
     lines = [
-        f"Today ({day:%a %d %b}):",
-        f"- Check-in: {'done' if checkin else 'not yet'}",
-        f"- Spoke to Kin {len(turns)} time(s)" + (f", last at {turns[-1][0][11:16]}" if turns else ""),
+        f"{label} ({day:%a %d %b}):",
+        f"- Last sign of {person}: {last[11:16]}" if last else f"- No sign of {person} recorded",
+        f"- Check-in: {checkin}",
+        f"- Spoke with Kin {len(turns)} time{'' if len(turns) == 1 else 's'}"
+        + (f", last at {turns[-1][0][11:16]}" if turns else ""),
         "- Reminders: " + ("; ".join(settled) if settled else "none recorded"),
     ]
+    if family_in or family_out:
+        lines.append(f"- Family: {family_in} message{'' if family_in == 1 else 's'} delivered, {family_out} sent back")
     if alerts:
         lines.append("- Alerts: " + "; ".join(alerts))
+    if blind:
+        lines.append(f"- Robot: out of reach for {blind // 60} h {blind % 60:02d} min at the longest; "
+                     f"that says nothing about {person}")
     return "\n".join(lines)
 
 
@@ -79,8 +107,9 @@ def build(memory: Memory, day: date | None = None) -> str:
         # on Sep 30 the robot was unreachable for 20 hours and the family got no note whatsoever.
         blind = blind_for(memory, day)
         if blind >= 60:
+            hours = blind // 60
             return (f"Kin's note for {day:%A %d %B}\n\nI could not reach my robot for about "
-                    f"{blind // 60} hour(s) today, so I have nothing to tell you about how "
+                    f"{hours} hour{'' if hours == 1 else 's'} today, so I have nothing to tell you about how "
                     f"{config.person_name() or 'she'} has been. This is a fault at my end, not a sign "
                     "about her. It may be worth a call, and the robot may need restarting.")
         return f"Kin's note for {day:%A %d %B}: a quiet day. No conversations or reminders were recorded."

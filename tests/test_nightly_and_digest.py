@@ -104,9 +104,32 @@ def test_status_shows_the_final_outcome_per_reminder(memory):
 
     text = digest.status(memory)
 
-    assert text.count("afternoon walk") == 1
+    assert text.count("afternoon walk") == 1 and text.count("no response") == 1, "a run of the same outcome is one entry"
     assert "afternoon walk: no response" in text
-    assert "Spoke to Kin 1 time(s)" in text and "Check-in: not yet" in text
+    assert "Spoke with Kin 1 time" in text and "Check-in: not yet" in text and text.startswith("Today (")
+
+
+def test_status_tells_the_day_in_times(memory, monkeypatch):
+    """Oct 29: /status for yesterday read as "Today" and gave the final word per reminder with no times."""
+    from datetime import date, timedelta
+
+    yesterday = date.today() - timedelta(days=1)
+    now = {"ts": f"{yesterday}T12:00:00"}
+    monkeypatch.setattr("kin.memory._now", lambda: now["ts"])
+    pills = memory.add_reminder("take your pills", "12:00")
+    for stamp, action in [("12:37", lambda: memory.log_reminder(pills, "confirmed")),
+                          ("13:10", lambda: memory.log_reminder(pills, "no_response")),
+                          ("12:19", lambda: memory.log_event("checkin", "Checked in: fine, plans a walk.")),
+                          ("12:40", lambda: memory.log_event("family_in", "Vlad: do you need apples?"))]:
+        now["ts"] = f"{yesterday}T{stamp}:00"
+        action()
+
+    text = digest.status(memory, yesterday)
+
+    assert text.startswith("Yesterday (")
+    assert "take your pills: confirmed 12:37, no response 13:10" in text
+    assert "Check-in: done at 12:19" in text and "Family: 1 message delivered, 0 sent back" in text
+    assert "Last sign of" in text
 
 
 def test_a_quiet_day_needs_no_model_call(memory):
@@ -142,7 +165,7 @@ def test_the_weekly_note_is_on_record_when_sent(memory, family):
     memory.log_event("trends", "Water reminders were missed on Monday and Thursday.")
 
     kin._send_weekly_note()
-    kin._run_family_command(chat_id=42, command="/week")
+    kin._run_family_command(chat_id=42, text="/week")
 
     assert [s.startswith("Kin's weekly note\n\n") for s in family.sent] == [True, True]
     assert "missed on Monday and Thursday" in family.sent[0]
@@ -237,3 +260,23 @@ def test_the_container_modules_load_without_the_database_module(monkeypatch):
     for name in ("kin.consolidate", "kin.nightly"):
         importlib.reload(sys.modules[name])
     assert nightly.run({"today": "x", "person": "p", "facts": "", "conversation": "", "week": []})["trends"].startswith("Not enough history")
+
+
+def test_digest_can_be_asked_for_yesterday(memory, family, monkeypatch):
+    """Oct 29: the evening note goes out at 20:00; "/digest" the next morning gave only the new day's
+    outage line, and there was no way to ask for the full note again."""
+    from datetime import date, timedelta
+
+    from kin import digest, service
+
+    asked = []
+    monkeypatch.setattr(digest, "build", lambda mem, day=None: asked.append(day) or f"note for {day}")
+    kin = service.Service.__new__(service.Service)
+    kin.memory, kin.family = memory, family
+
+    kin._run_family_command(chat_id=42, text="/digest")
+    kin._run_family_command(chat_id=42, text="/Digest yesterday")
+    kin._run_family_command(chat_id=42, text="/digest 2026-10-28")
+    kin._run_family_command(chat_id=42, text="/digest nonsense")
+    assert asked == [None, date.today() - timedelta(days=1), date(2026, 10, 28), None]
+    assert len(family.sent) == 4

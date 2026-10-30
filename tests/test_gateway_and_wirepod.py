@@ -505,7 +505,7 @@ def test_a_day_kin_was_blind_is_not_reported_as_a_quiet_day(memory):
     memory.log_event("robot_down", "I have not been able to reach the robot for 768 minutes. Reminders ...")
     note = digest.build(memory, date.today())
 
-    assert "could not reach my robot" in note and "12 hour(s)" in note
+    assert "could not reach my robot" in note and "12 hours" in note
     assert "quiet day" not in note
     assert "not a sign" in note, "and it says plainly that it is a fault at Kin's end"
 

@@ -22,7 +22,7 @@ import re
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from kin import robot as kin_robot
 from kin import alerts, config, digest, family, gateway, nightly, voice, weather, wirepod
@@ -89,6 +89,19 @@ RETURN_HOME_EVERY_SECONDS = 1800  # and again no sooner than this if it failed (
 ACK_SECONDS = 3.5      # how long Vector needs to say "On it!" himself before Kin takes over
 HEARD_STALE_MINUTES = 3
 FAMILY_COMMANDS = ("/start", "/help", "/status", "/digest", "/week")  # answered from memory; no robot needed
+
+
+def day_asked(words: list[str]) -> date | None:
+    """The day a family command is about: "/digest yesterday" or "/digest 2026-10-28". None means today.
+    Oct 29: the evening note is sent at 20:00, and a family member who missed it had no way to ask again."""
+    if not words:
+        return None
+    if words[0].lower() == "yesterday":
+        return date.today() - timedelta(days=1)
+    try:
+        return date.fromisoformat(words[0])
+    except ValueError:
+        return None
 TOUCHED = (
     "[The person petted your back to get your attention. Greet them and ask what they need in ONE `ask` "
     "call, for example 'Hello Jennie, what can I do for you?'. Do not `say` a greeting first: that makes "
@@ -196,7 +209,7 @@ class Service:
     def _handle_family_message(self, agent: Agent, chat_id: int, sender: str, text: str, received_at: str) -> bool:
         command = text.split()[0].lower()
         if command in FAMILY_COMMANDS:
-            self._run_family_command(chat_id, command)
+            self._run_family_command(chat_id, text)
         else:
             log(f"family message from {sender}")
             self.memory.log_event("family_in", f"{sender}: {text}")
@@ -621,7 +634,7 @@ class Service:
         while (row := self.memory.inbox_next()) is not None:
             update_id, chat_id, sender, text, _ = row
             if text.split()[0].lower() in FAMILY_COMMANDS:
-                self._run_family_command(chat_id, text.split()[0].lower())
+                self._run_family_command(chat_id, text)
                 self.memory.inbox_done(update_id)
                 continue
             if robot_reachable:
@@ -634,16 +647,19 @@ class Service:
                     "deliver it as soon as he is back and tell you what she says.", chat_id=chat_id)
             return  # leave it in the inbox, in order, for delivery later
 
-    def _run_family_command(self, chat_id: int, command: str) -> None:
+    def _run_family_command(self, chat_id: int, text: str) -> None:
+        command, *words = text.split()
+        command = command.lower()
         if command in ("/start", "/help"):
             self.family.send(
                 "I'm Kin. Send me any message and I will deliver it in person and tell you the reply.\n"
-                "/status - how today is going\n/digest - today's note now\n/week - patterns over the last week",
+                "/status - how today is going\n/digest - today's note now\n(both take 'yesterday' or a date)\n"
+                "/week - patterns over the last week",
                 chat_id=chat_id)
         elif command == "/status":
-            self.family.send(digest.status(self.memory), chat_id=chat_id)
+            self.family.send(digest.status(self.memory, day_asked(words)), chat_id=chat_id)
         elif command == "/digest":
-            self.family.send(digest.build(self.memory), chat_id=chat_id)
+            self.family.send(digest.build(self.memory, day_asked(words)), chat_id=chat_id)
         elif command == "/week":
             self._send_weekly_note(chat_id=chat_id)
 

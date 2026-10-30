@@ -8,10 +8,10 @@ Kin is not a medical device. Reminders are a nudge and a log.
 
 ## What Kin does
 
-A phone notification is easy to ignore. A small robot that drives over, looks up at you and asks a question is not. Kin is for two people: an older adult living alone, and the relative who worries about them.
+A phone notification is easy to ignore. A small robot that looks up at you and asks a question is not. Kin is for two people: an older adult living alone, and the relative who worries about them.
 
 - **Daily check-in.** At a set time he finds the person, greets them by name, asks how they are, and follows up on what he remembers ("You mentioned a dentist visit, how did it go?"). He tells them the day's weather.
-- **Reminders that come to you.** Pills, water, a walk: set by voice ("remind me to drink water at six every day"). When one is due he goes looking for the person and asks. He tries again ten minutes later if there is no answer, accepts "not today" gracefully, and logs the outcome.
+- **Reminders that ask and listen.** Pills, water, a walk: set by voice ("remind me to drink water at six every day"). When one is due he looks for the person, asks, and listens for the answer. He tries again ten minutes later if there is no answer, accepts "not today" gracefully, and logs the outcome.
 - **Presence.** Through the morning he quietly looks for the person from his charger. If there has been no sign of them by a deadline he calls out once; then the family is told, and told again when the person turns up.
 - **Family bridge (Telegram).** A relative's message is delivered in person, and the spoken reply goes back. The family gets a short note each evening, a weekly note on patterns (reminders missed several days running, a worry mentioned again and again), and an alert when a reminder goes unanswered or the robot itself stops responding.
 - **Scam check.** Older adults are the main target of phone, text and mail fraud. Describe a suspicious message and Kin says "please don't do anything yet", searches the live web for matching scam reports, and says plainly what he found. He will say a message matches a known scam or that he could not confirm it; he never says a message is safe.
@@ -42,7 +42,7 @@ You talk to him the way you talk to any Vector: say "Hey Vector" or press the bu
 
 **Private by design.** Speech recognition and the voice run offline on the hub, so no audio leaves the home. Camera frames are analysed and never stored. Memory is a local SQLite file. The family note is written from one day's log, not the whole history, and Kin tells the person what he shares.
 
-**Built to be left alone.** Every robot call has a deadline and can be cut short by a pet; a dropped link is noticed within 30 seconds and reconnected; family messages are saved before they are acknowledged, so a restart cannot lose one; each alert is sent exactly once. 233 tests run without a robot, a network or API keys.
+**Built to be left alone.** Every robot call has a deadline and can be cut short by a pet; a dropped link is noticed within 30 seconds and reconnected; family messages are saved before they are acknowledged, so a restart cannot lose one; each alert is sent once a day. 236 tests run without a robot, a network or API keys.
 
 ## Setup
 
@@ -153,7 +153,7 @@ pip install -e ".[dev]"
 python -m pytest
 ```
 
-233 tests covering memory, reminders, family alerts, the durable inbox, the agent loop, listening, tool dispatch, weather, the voice and the nightly reflection. They need no robot, network or API keys.
+236 tests covering memory, reminders, family alerts, the durable inbox, the agent loop, listening, tool dispatch, weather, the voice and the nightly reflection. They need no robot, network or API keys.
 
 ## License
 

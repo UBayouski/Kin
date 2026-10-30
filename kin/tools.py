@@ -335,8 +335,19 @@ class RobotTools:
         self._speak(question)
         # A closing offer ("anything else?") that meets silence should not keep him listening for long.
         seconds = CLOSING_LISTEN_SECONDS if is_closing_offer(question) else LISTEN_SECONDS
+        deadline = time.monotonic() + seconds
+        remaining = seconds
         with kin_robot.animating(self.robot, "VC_ListeningLoop"):  # his own "I'm listening" look
-            reply = self.ears.listen(timeout=seconds)
+            while True:
+                reply = self.ears.listen(timeout=remaining)
+                remaining = deadline - time.monotonic()
+                # Oct 28: the microphone opened on the tail of his own question through the speaker, a
+                # word or two of it came back as "the reply", and he gave up while she was drawing breath.
+                # His own words are not an answer and not silence either: keep listening for the rest.
+                if reply and is_echo(question, reply) and remaining > 1.0:
+                    print("  (heard his own words back; still listening)", flush=True)
+                    continue
+                break
         if not reply or is_echo(question, reply):
             # Oct 9: "Anything else?" got a quiet "no" (three seconds of voice at a third of her usual level,
             # no words found in it) and Kin ended without a word, as if nobody were there.
